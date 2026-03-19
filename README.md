@@ -22,42 +22,45 @@ make                        # debug build (ASAN + UBSAN enabled)
 make BUILD=release          # release build
 ```
 
-LKL is fetched automatically from GitHub Actions artifacts on first build (requires `gh` CLI). To use a custom LKL:
+LKL is fetched automatically from the [nightly pre-release](https://github.com/sysprog21/kbox/releases/tag/lkl-nightly) on first build. Pre-built binaries are available for both x86_64 and aarch64. To use a custom LKL:
 
 ```bash
-make LKL_DIR=/path/to/lkl
+make LKL_DIR=/path/to/lkl              # point to a directory with liblkl.a + lkl.h
+make FORCE_LKL_BUILD=1                 # force a from-source LKL rebuild
 ```
 
 ## Quick start
 
-Build a test rootfs image (requires `e2fsprogs` for `mkfs.ext4`/`debugfs`, no root needed):
+Build a test rootfs image (requires `e2fsprogs`, no root needed). The script auto-detects the host architecture and downloads the matching Alpine minirootfs:
 
 ```bash
-make rootfs                 # creates rootfs.ext4 with busybox
+make rootfs                 # creates alpine.ext4
 ```
 
 ## Usage
 
 ```bash
-# Boot an Alpine Linux ext4 image, run /bin/sh
-./kbox image -r alpine.ext4
+# Interactive shell with recommended mounts + root identity (recommended)
+./kbox image -S alpine.ext4 -- /bin/sh -i
 
-# Same, with recommended mounts (proc, sysfs, devtmpfs, devpts, tmpfs)
-./kbox image -R alpine.ext4
-
-# System root: recommended mounts + uid=0/gid=0 inside the guest (no host privileges)
-./kbox image -S alpine.ext4
-
-# Run a specific command (args after -- become the command)
+# Run a specific command
 ./kbox image -S alpine.ext4 -- /bin/ls -la /
 
+# Recommended mounts without root identity
+./kbox image -R alpine.ext4 -- /bin/sh -i
+
+# Raw mount only (no /proc, /sys, /dev -- for targeted commands)
+./kbox image -r alpine.ext4 -- /bin/cat /etc/os-release
+
 # Minimal mount profile (proc + tmpfs only)
-./kbox image -S alpine.ext4 --mount-profile minimal
+./kbox image -S alpine.ext4 --mount-profile minimal -- /bin/sh -i
 
 # Custom kernel cmdline, bind mount, explicit identity
 ./kbox image -r alpine.ext4 -k "mem=2048M loglevel=7" \
-    -b /home/user/data:/mnt/data --change-id 1000:1000
+    -b /home/user/data:/mnt/data --change-id 1000:1000 -- /bin/sh -i
 ```
+
+Note: use `/bin/sh -i` for interactive sessions. The `-i` flag forces the shell into interactive mode regardless of terminal detection.
 
 Run `./kbox image --help` for the full option list.
 
@@ -65,9 +68,9 @@ Run `./kbox image --help` for the full option list.
 
 ```bash
 make check                  # all tests (unit + integration + stress)
-make check-unit             # 74 unit tests under ASAN/UBSAN
-make check-integration      # ~45 integration tests against a rootfs image
-make check-stress           # 5 stress test programs
+make check-unit             # unit tests under ASAN/UBSAN
+make check-integration      # integration tests against a rootfs image
+make check-stress           # stress test programs
 ```
 
 Unit tests have no LKL dependency and run on any Linux host. Integration and stress tests require a rootfs image (built via `make rootfs`).
@@ -81,7 +84,7 @@ Unit tests have no LKL dependency and run on any Linux host. Integration and str
                         │ syscall notification
                  ┌──────▼──────────┐
                  │  supervisor     │  seccomp_dispatch.c
-                 │  (dispatch)     │  114 syscall entries
+                 │  (dispatch)     │  144+ syscall entries
                  └────┬───────┬────┘
           LKL path    │       │  host path (CONTINUE)
           ┌───────────▼──┐ ┌──▼──────────┐
@@ -128,20 +131,21 @@ See `docs/gdb-workflow.md` for the full workflow.
 ## Project layout
 
 ```
-src/                    18 C source files (~8300 lines)
+src/                    18 C source files (~8500 lines)
 include/kbox/           14 headers (~1000 lines)
-tests/unit/             6 unit test suites (74 tests)
+tests/unit/             6 unit test suites (82 tests)
 tests/guest/            5 guest test programs (run inside kbox)
 tests/stress/           5 stress test programs
 scripts/gdb/            GDB helpers + 48 VFS path tests
-scripts/                build, fetch, integration test runner
+scripts/                build, fetch, rootfs, integration test runner
+.github/                CI workflows + nightly LKL build
 docs/                   syscall parity spec, GDB workflow
 ```
 
 ## Targets
 
-- x86_64 (primary, fully tested)
-- aarch64 (syscall tables populated, end-to-end verification pending)
+- x86_64
+- aarch64
 
 ## License
 
