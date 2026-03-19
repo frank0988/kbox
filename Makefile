@@ -97,15 +97,19 @@ ROOTFS       = alpine.ext4
 
 # ---- Top-level targets ----
 
-.PHONY: all clean check check-unit check-integration check-stress guest-bins stress-bins rootfs fetch-lkl
+.PHONY: all clean check check-unit check-integration check-stress guest-bins stress-bins rootfs fetch-lkl install-hooks
 
-all: $(TARGET)
+all: .git/hooks/pre-commit $(TARGET)
 
 $(TARGET): $(OBJS) | $(LKL_LIB)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Auto-install git hooks on first build.
+.git/hooks/pre-commit: scripts/pre-commit.hook
+	@$(MAKE) -s install-hooks
 
 # Auto-fetch LKL if missing
 $(LKL_LIB):
@@ -156,6 +160,14 @@ $(ROOTFS): scripts/mkrootfs.sh scripts/alpine-sha256.txt $(GUEST_BINS) $(STRESS_
 
 fetch-lkl:
 	./scripts/fetch-lkl.sh
+
+# Install git hooks from scripts/*.hook into .git/hooks/.
+install-hooks:
+	@for hook in scripts/*.hook; do \
+	    name=$$(basename "$$hook" .hook); \
+	    ln -sf ../../"$$hook" .git/hooks/"$$name"; \
+	    echo "Installed $$name hook"; \
+	done
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) $(TEST_DIR)/*.o
