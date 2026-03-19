@@ -85,6 +85,7 @@ const struct kbox_sysnrs SYSNRS_X86_64 = {
     .uname = 63,
     .getrandom = 318,
     .prctl = 157,
+    .syslog = 116,
 };
 
 const struct kbox_sysnrs SYSNRS_GENERIC = {
@@ -160,6 +161,7 @@ const struct kbox_sysnrs SYSNRS_GENERIC = {
     .uname = 160,
     .getrandom = 278,
     .prctl = 167,
+    .syslog = 116,
 };
 
 const struct kbox_host_nrs HOST_NRS_X86_64 = {
@@ -256,6 +258,7 @@ const struct kbox_host_nrs HOST_NRS_X86_64 = {
     .linkat = 265,
     .utimensat = 280,
     .ioctl = 16,
+    .syslog = 103,
     .umask = 95,
     .uname = 63,
     .brk = 12,
@@ -416,6 +419,7 @@ const struct kbox_host_nrs HOST_NRS_AARCH64 = {
     .linkat = 37,
     .utimensat = 88,
     .ioctl = 29,
+    .syslog = 116,
     .umask = 166,
     .uname = 160,
     .brk = 214,
@@ -645,6 +649,7 @@ const char *syscall_name_from_nr(const struct kbox_host_nrs *h, int nr)
     CHECK(linkat);
     CHECK(utimensat);
     CHECK(ioctl);
+    CHECK(syslog);
     CHECK(umask);
     CHECK(uname);
     CHECK(brk);

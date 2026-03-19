@@ -64,6 +64,7 @@ struct kbox_sysnrs {
     long uname;
     long getrandom;
     long prctl;
+    long syslog;
 };
 
 extern const struct kbox_sysnrs SYSNRS_X86_64;
@@ -113,6 +114,9 @@ struct kbox_host_nrs {
     int fsync, fdatasync, sync;
     int symlinkat, linkat, utimensat;
     int ioctl;
+
+    /* Kernel info */
+    int syslog;
 
     /* Process lifecycle */
     int umask, uname, brk, getrandom, prctl;

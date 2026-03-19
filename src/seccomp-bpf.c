@@ -139,7 +139,6 @@ static const int deny_nrs[] = {
 
     /* Misc */
     153, /* vhangup */
-    103, /* syslog/klogctl */
 };
 
 #elif defined(__aarch64__)
@@ -240,8 +239,7 @@ static const int deny_nrs[] = {
     1, /* io_destroy */
 
     /* Misc */
-    58,  /* vhangup */
-    116, /* syslog */
+    58, /* vhangup */
 };
 
 #else

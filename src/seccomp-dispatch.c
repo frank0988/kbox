@@ -162,7 +162,7 @@ static inline long lkl_to_host_open_flags(long flags)
 
 struct kbox_dispatch kbox_dispatch_continue(void)
 {
-    return (struct kbox_dispatch){
+    return (struct kbox_dispatch) {
         .kind = KBOX_DISPATCH_CONTINUE,
         .val = 0,
         .error = 0,
@@ -173,7 +173,7 @@ struct kbox_dispatch kbox_dispatch_errno(int err)
 {
     if (err <= 0)
         err = EIO;
-    return (struct kbox_dispatch){
+    return (struct kbox_dispatch) {
         .kind = KBOX_DISPATCH_RETURN,
         .val = 0,
         .error = err,
@@ -182,7 +182,7 @@ struct kbox_dispatch kbox_dispatch_errno(int err)
 
 struct kbox_dispatch kbox_dispatch_value(int64_t val)
 {
-    return (struct kbox_dispatch){
+    return (struct kbox_dispatch) {
         .kind = KBOX_DISPATCH_RETURN,
         .val = val,
         .error = 0,
@@ -2568,6 +2568,81 @@ static struct kbox_dispatch forward_getrandom(
 }
 
 /* ------------------------------------------------------------------ */
+/* forward_syslog (klogctl)                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * syslog(type, buf, len) -- forward to LKL so dmesg shows the LKL
+ * kernel's ring buffer, not the host's.
+ *
+ * Types that read into buf (2=READ, 3=READ_ALL, 4=READ_CLEAR):
+ *   call LKL with a scratch buffer, then copy to tracee.
+ * Types that just return a value (0,1,5-10):
+ *   forward type+len, return the result directly.
+ */
+#define SYSLOG_ACTION_READ 2
+#define SYSLOG_ACTION_READ_ALL 3
+#define SYSLOG_ACTION_READ_CLEAR 4
+#define SYSLOG_ACTION_SIZE_BUFFER 10
+
+static struct kbox_dispatch forward_syslog(
+    const struct kbox_seccomp_notif *notif,
+    struct kbox_supervisor_ctx *ctx)
+{
+    pid_t pid = notif->pid;
+    long type = to_c_long_arg(notif->data.args[0]);
+    uint64_t remote_buf = notif->data.args[1];
+    long len = to_c_long_arg(notif->data.args[2]);
+
+    int needs_buf =
+        (type == SYSLOG_ACTION_READ || type == SYSLOG_ACTION_READ_ALL ||
+         type == SYSLOG_ACTION_READ_CLEAR);
+
+    if (!needs_buf) {
+        /* No buffer transfer: SIZE_BUFFER, CONSOLE_ON/OFF, etc. */
+        long ret = lkl_syscall6(ctx->sysnrs->syslog, type, 0, len, 0, 0, 0);
+        return kbox_dispatch_from_lkl(ret);
+    }
+
+    if (len <= 0)
+        return kbox_dispatch_errno(EINVAL);
+    if (remote_buf == 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    /*
+     * Static buffer -- safe because the supervisor is single-threaded.
+     * Clamp to the actual LKL ring buffer size so READ_CLEAR never
+     * discards data beyond what we can copy out.  The ring buffer size
+     * is fixed at boot, so cache it after the first query.
+     * Hard-cap at 1MB (the static buffer size) as a safety ceiling.
+     */
+    static uint8_t scratch[1024 * 1024];
+    static long cached_ring_sz;
+    if (!cached_ring_sz) {
+        long sz = lkl_syscall6(ctx->sysnrs->syslog, SYSLOG_ACTION_SIZE_BUFFER,
+                               0, 0, 0, 0, 0);
+        cached_ring_sz = (sz > 0) ? sz : -1;
+    }
+    if (cached_ring_sz > 0 && len > cached_ring_sz)
+        len = cached_ring_sz;
+    if (len > (long) sizeof(scratch))
+        len = (long) sizeof(scratch);
+
+    long ret =
+        lkl_syscall6(ctx->sysnrs->syslog, type, (long) scratch, len, 0, 0, 0);
+    if (ret < 0)
+        return kbox_dispatch_errno((int) (-ret));
+
+    size_t n = (size_t) ret;
+    int wrc = kbox_vm_write(pid, remote_buf, scratch, n);
+
+    if (wrc < 0)
+        return kbox_dispatch_errno(-wrc);
+
+    return kbox_dispatch_value((int64_t) n);
+}
+
+/* ------------------------------------------------------------------ */
 /* forward_prctl                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -3973,6 +4048,8 @@ struct kbox_dispatch kbox_dispatch_syscall(struct kbox_supervisor_ctx *ctx,
         return kbox_dispatch_continue();
     if (nr == h->getrandom)
         return forward_getrandom(notif, ctx);
+    if (nr == h->syslog)
+        return forward_syslog(notif, ctx);
     if (nr == h->prctl)
         return forward_prctl(notif, ctx);
     if (nr == h->wait4)
