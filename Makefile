@@ -7,6 +7,8 @@ CFLAGS   ?=
 LDFLAGS  ?=
 BUILD    ?= debug
 
+ARCH ?= $(shell uname -m)
+
 CFLAGS  += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow
 CFLAGS  += -Wno-unused-parameter
 CFLAGS  += -Iinclude -Isrc
@@ -19,7 +21,7 @@ else
 endif
 
 # LKL library
-LKL_DIR  ?= lkl-x86_64
+LKL_DIR  ?= lkl-$(ARCH)
 LKL_LIB   = $(LKL_DIR)/liblkl.a
 
 LDFLAGS += -L$(LKL_DIR) -L$(LKL_DIR)/lib
@@ -129,7 +131,7 @@ $(TARGET): $(OBJS) | $(LKL_LIB)
 # Auto-fetch LKL if missing
 $(LKL_LIB):
 	@echo "LKL library not found at $(LKL_DIR). Fetching..."
-	./scripts/fetch-lkl.sh
+	./scripts/fetch-lkl.sh $(ARCH)
 
 # Auto-fetch minislirp if missing (shallow clone, no submodule).
 # $(wildcard) evaluates at parse time, so if minislirp has not been
@@ -188,14 +190,14 @@ $(STRESS_DIR)/%: $(STRESS_DIR)/%.c
 rootfs: $(ROOTFS)
 
 $(ROOTFS): scripts/mkrootfs.sh scripts/alpine-sha256.txt $(GUEST_BINS) $(STRESS_BINS)
-	./scripts/mkrootfs.sh
+	ALPINE_ARCH=$(ARCH) ./scripts/mkrootfs.sh
 
 # ---- Utilities ----
 
 # Fetch LKL from nightly release if not cached locally.
 # To force re-download: rm -rf lkl-x86_64 && make fetch-lkl
 fetch-lkl:
-	./scripts/fetch-lkl.sh
+	./scripts/fetch-lkl.sh $(ARCH)
 
 # Install git hooks from scripts/*.hook into .git/hooks/.
 # Skips hooks that already exist (preserves user customizations).

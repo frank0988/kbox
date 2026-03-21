@@ -83,6 +83,12 @@ make BUILD=release          # release build
 make KBOX_HAS_WEB=1         # enable web-based kernel observatory
 ```
 
+For cross-compilation, use `ARCH` to specify the target architecture and `CC` for the toolchain.
+
+```bash
+make BUILD=release ARCH=aarch64 CC=aarch64-linux-gnu-gcc
+```
+
 LKL is fetched automatically from the [nightly pre-release](https://github.com/sysprog21/kbox/releases/tag/lkl-nightly) on first build. Pre-built binaries are available for both x86_64 and aarch64. To use a custom LKL:
 
 ```bash
@@ -92,10 +98,14 @@ make FORCE_LKL_BUILD=1      # force a from-source LKL rebuild
 
 ## Quick start
 
-Build a test rootfs image (requires `e2fsprogs`, no root needed). The script auto-detects the host architecture and downloads the matching Alpine minirootfs:
+Build a test rootfs image (requires `e2fsprogs`, no root needed). By default, the script auto-detects the host architecture and downloads the matching Alpine minirootfs. The `ARCH` variable can be specified to build an image for the target architecture:
 
 ```bash
-make rootfs                 # creates alpine.ext4
+# Create alpine.ext4 for the host architecture
+make rootfs
+
+# Create alpine.ext4 for aarch64
+make ARCH=aarch64 CC=aarch64-linux-gnu-gcc rootfs
 ```
 
 ## Usage
