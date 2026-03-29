@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "kbox/compiler.h"
 #include "loader-transfer.h"
 
 int kbox_loader_prepare_transfer(const struct kbox_loader_handoff *handoff,
@@ -36,7 +37,15 @@ int kbox_loader_prepare_transfer(const struct kbox_loader_handoff *handoff,
     return 0;
 }
 
-__attribute__((noreturn)) void kbox_loader_transfer_to_guest(
+/* Suppress ASAN: this function switches to the guest stack and jumps to
+ * guest code.  ASAN's stack tracking doesn't know about the guest stack
+ * and would flag every subsequent stack access as a buffer overflow.
+ */
+__attribute__((noreturn))
+#if KBOX_HAS_ASAN
+__attribute__((no_sanitize("address")))
+#endif
+void kbox_loader_transfer_to_guest(
     const struct kbox_loader_transfer_state *state)
 {
     if (!state)

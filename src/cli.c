@@ -18,6 +18,7 @@ enum {
     OPT_WEB_BIND,
     OPT_SYSCALL_MODE,
     OPT_TRACE_FORMAT,
+    OPT_SQPOLL,
     OPT_HELP,
 };
 
@@ -41,6 +42,7 @@ static const struct option image_longopts[] = {
     {"web", optional_argument, NULL, OPT_WEB},
     {"web-bind", required_argument, NULL, OPT_WEB_BIND},
     {"syscall-mode", required_argument, NULL, OPT_SYSCALL_MODE},
+    {"sqpoll", no_argument, NULL, OPT_SQPOLL},
     {"trace-format", required_argument, NULL, OPT_TRACE_FORMAT},
     {"help", no_argument, NULL, OPT_HELP},
     {NULL, 0, NULL, 0},
@@ -76,6 +78,7 @@ void kbox_usage(const char *argv0)
         "      --mount-profile P      Mount profile: full (default), minimal\n"
         "      --syscall-mode MODE    Syscall path: auto (default), "
         "seccomp, trap, rewrite\n"
+        "      --sqpoll               Busy-poll service thread (no futex)\n"
         "      --web[=PORT]           Enable web observatory (default: 8080)\n"
         "      --web-bind ADDR        Bind address for web (default: "
         "127.0.0.1)\n"
@@ -219,6 +222,9 @@ static int parse_image_args(int argc,
                         optarg);
                 return -1;
             }
+            break;
+        case OPT_SQPOLL:
+            img->sqpoll = true;
             break;
         case OPT_TRACE_FORMAT:
 #ifdef KBOX_HAS_WEB

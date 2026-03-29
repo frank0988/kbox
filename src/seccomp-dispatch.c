@@ -85,6 +85,31 @@ static int try_cached_shadow_stat_dispatch(struct kbox_supervisor_ctx *ctx,
                                            pid_t pid);
 static void invalidate_path_shadow_cache(struct kbox_supervisor_ctx *ctx);
 static void invalidate_translated_path_cache(struct kbox_supervisor_ctx *ctx);
+
+static inline void invalidate_stat_cache_fd(struct kbox_supervisor_ctx *ctx,
+                                            long lkl_fd)
+{
+#if KBOX_STAT_CACHE_ENABLED
+    for (int i = 0; i < KBOX_STAT_CACHE_MAX; i++)
+        if (ctx->stat_cache[i].lkl_fd == lkl_fd)
+            ctx->stat_cache[i].lkl_fd = -1;
+#else
+    (void) ctx;
+    (void) lkl_fd;
+#endif
+}
+
+/* Close an LKL FD and evict it from the stat cache.  Every LKL close in
+ * the dispatch code should go through this wrapper to prevent stale fstat
+ * results when the LKL FD number is reused.
+ */
+static inline long lkl_close_and_invalidate(struct kbox_supervisor_ctx *ctx,
+                                            long lkl_fd)
+{
+    invalidate_stat_cache_fd(ctx, lkl_fd);
+    return kbox_lkl_close(ctx->sysnrs, lkl_fd);
+}
+
 static int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
                                      const struct kbox_syscall_request *req,
                                      long lkl_fd,
@@ -986,7 +1011,6 @@ static int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
     struct kbox_fd_entry *entry;
     long flags;
     int memfd;
-    int injected;
 
     off_t cur_off;
 
@@ -1010,6 +1034,7 @@ static int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
     memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
     if (memfd < 0)
         return -1;
+    kbox_shadow_seal(memfd);
 
     cur_off = (off_t) kbox_lkl_lseek(ctx->sysnrs, lkl_fd, 0, SEEK_CUR);
     if (cur_off >= 0 && lseek(memfd, cur_off, SEEK_SET) < 0) {
@@ -1018,8 +1043,8 @@ static int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
     }
 
     if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP) {
-        injected = request_addfd_at(ctx, req, memfd, (int) fd,
-                                    entry->cloexec ? O_CLOEXEC : 0);
+        int injected = request_addfd_at(ctx, req, memfd, (int) fd,
+                                        entry->cloexec ? O_CLOEXEC : 0);
         if (injected < 0) {
             close(memfd);
             return -1;
@@ -1177,7 +1202,7 @@ static struct kbox_dispatch finish_open_dispatch(
     long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd,
                                     kbox_is_tty_like_path(translated));
     if (vfd < 0) {
-        kbox_lkl_close(ctx->sysnrs, lkl_fd);
+        lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(EMFILE);
     }
     if (flags & O_CLOEXEC)
@@ -1440,6 +1465,10 @@ static int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
     memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
     if (memfd < 0)
         return 0;
+    /* Do NOT seal: this shadow is for a writable FD; the tracee needs
+     * write access.  Only read-only shadows (ensure_same_fd_shadow) are
+     * sealed.
+     */
 
     fast_fd = kbox_fd_table_insert_fast(ctx->fd_table, lkl_fd, 0);
     if (fast_fd < 0) {
@@ -1707,6 +1736,9 @@ static struct kbox_dispatch forward_close(
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
     int same_fd_shadow = entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW;
 
+    if (lkl_fd >= 0)
+        invalidate_stat_cache_fd(ctx, lkl_fd);
+
     if (entry && entry->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY &&
         entry->shadow_sp >= 0) {
         kbox_fd_table_remove(ctx->fd_table, fd);
@@ -1718,12 +1750,12 @@ static struct kbox_dispatch forward_close(
             if (entry && entry->shadow_writeback)
                 (void) sync_shadow_writeback(ctx, entry);
             note_shadow_writeback_close(ctx, entry);
-            kbox_lkl_close(ctx->sysnrs, lkl_fd);
+            lkl_close_and_invalidate(ctx, lkl_fd);
             kbox_fd_table_remove(ctx->fd_table, fd);
             return kbox_dispatch_continue();
         }
 
-        long ret = kbox_lkl_close(ctx->sysnrs, lkl_fd);
+        long ret = lkl_close_and_invalidate(ctx, lkl_fd);
         if (ret < 0 && fd >= KBOX_FD_BASE)
             return kbox_dispatch_errno((int) (-ret));
         kbox_fd_table_remove(ctx->fd_table, fd);
@@ -1751,6 +1783,8 @@ static struct kbox_dispatch forward_close(
         if (shadow_entry && shadow_entry->shadow_writeback)
             (void) sync_shadow_writeback(ctx, shadow_entry);
         note_shadow_writeback_close(ctx, shadow_entry);
+        if (lkl >= 0)
+            invalidate_stat_cache_fd(ctx, lkl);
         kbox_fd_table_remove(ctx->fd_table, vfd);
 
         if (lkl >= 0) {
@@ -1769,7 +1803,7 @@ static struct kbox_dispatch forward_close(
             }
             if (!still_ref) {
                 kbox_net_deregister_socket((int) lkl);
-                kbox_lkl_close(ctx->sysnrs, lkl);
+                lkl_close_and_invalidate(ctx, lkl);
             }
         }
         return kbox_dispatch_continue();
@@ -1795,10 +1829,9 @@ static struct kbox_dispatch forward_read_like(
             return kbox_dispatch_continue();
     }
     {
-        struct kbox_fd_entry *entry;
         int shadow_rc = ensure_same_fd_shadow(ctx, req, fd, lkl_fd);
         if (shadow_rc > 0) {
-            entry = fd_table_entry(ctx->fd_table, fd);
+            struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
             if (entry && entry->host_fd == KBOX_FD_LOCAL_ONLY_SHADOW) {
                 return forward_local_shadow_read_like(req, ctx, entry, lkl_fd,
                                                       is_pread);
@@ -1886,6 +1919,8 @@ static struct kbox_dispatch forward_write(
         return kbox_dispatch_continue();
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
+
+    invalidate_stat_cache_fd(ctx, lkl_fd);
 
     int mirror_host = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
 
@@ -2098,10 +2133,9 @@ static struct kbox_dispatch forward_lseek(
             return kbox_dispatch_continue();
     }
     {
-        struct kbox_fd_entry *entry;
         int shadow_rc = ensure_same_fd_shadow(ctx, req, fd, lkl_fd);
         if (shadow_rc > 0) {
-            entry = fd_table_entry(ctx->fd_table, fd);
+            struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
             if (entry && entry->host_fd == KBOX_FD_LOCAL_ONLY_SHADOW)
                 return forward_local_shadow_lseek(req, ctx, entry, lkl_fd);
             return kbox_dispatch_continue();
@@ -2202,7 +2236,7 @@ static struct kbox_dispatch forward_fcntl(
         int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
         long new_vfd = kbox_fd_table_insert(ctx->fd_table, ret, mirror);
         if (new_vfd < 0) {
-            kbox_lkl_close(ctx->sysnrs, ret);
+            lkl_close_and_invalidate(ctx, ret);
             return kbox_dispatch_errno(EMFILE);
         }
         if (cmd == F_DUPFD_CLOEXEC)
@@ -2286,7 +2320,7 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
     int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
     long new_vfd = kbox_fd_table_insert(ctx->fd_table, ret, mirror);
     if (new_vfd < 0) {
-        kbox_lkl_close(ctx->sysnrs, ret);
+        lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EMFILE);
     }
     return kbox_dispatch_value((int64_t) new_vfd);
@@ -2320,7 +2354,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                     /* Remove any stale mapping at newfd (virtual or shadow). */
                     long stale = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
                     if (stale >= 0) {
-                        kbox_lkl_close(ctx->sysnrs, stale);
+                        lkl_close_and_invalidate(ctx, stale);
                         kbox_fd_table_remove(ctx->fd_table, newfd);
                     } else {
                         long sv =
@@ -2339,7 +2373,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                                         ref = 1;
                                 if (!ref) {
                                     kbox_net_deregister_socket((int) sl);
-                                    kbox_lkl_close(ctx->sysnrs, sl);
+                                    lkl_close_and_invalidate(ctx, sl);
                                 }
                             }
                         }
@@ -2373,7 +2407,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
          */
         long stale = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
         if (stale >= 0) {
-            kbox_lkl_close(ctx->sysnrs, stale);
+            lkl_close_and_invalidate(ctx, stale);
             kbox_fd_table_remove(ctx->fd_table, newfd);
         } else {
             long sv = kbox_fd_table_find_by_host_fd(ctx->fd_table, newfd);
@@ -2390,7 +2424,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
                             ref = 1;
                     if (!ref) {
                         kbox_net_deregister_socket((int) sl);
-                        kbox_lkl_close(ctx->sysnrs, sl);
+                        lkl_close_and_invalidate(ctx, sl);
                     }
                 }
             }
@@ -2410,11 +2444,11 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
 
     long existing = kbox_fd_table_remove(ctx->fd_table, newfd);
     if (existing >= 0)
-        kbox_lkl_close(ctx->sysnrs, existing);
+        lkl_close_and_invalidate(ctx, existing);
 
     int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, oldfd);
     if (kbox_fd_table_insert_at(ctx->fd_table, newfd, ret, mirror) < 0) {
-        kbox_lkl_close(ctx->sysnrs, ret);
+        lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EBADF);
     }
     return kbox_dispatch_value((int64_t) newfd);
@@ -2456,7 +2490,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                     /* Remove stale mapping at newfd (virtual or shadow). */
                     long stale3 = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
                     if (stale3 >= 0) {
-                        kbox_lkl_close(ctx->sysnrs, stale3);
+                        lkl_close_and_invalidate(ctx, stale3);
                         kbox_fd_table_remove(ctx->fd_table, newfd);
                     } else {
                         long sv3 =
@@ -2476,7 +2510,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                                         r3 = 1;
                                 if (!r3) {
                                     kbox_net_deregister_socket((int) sl3);
-                                    kbox_lkl_close(ctx->sysnrs, sl3);
+                                    lkl_close_and_invalidate(ctx, sl3);
                                 }
                             }
                         }
@@ -2508,7 +2542,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
         /* Same stale-redirect cleanup as forward_dup2. */
         long stale = kbox_fd_table_get_lkl(ctx->fd_table, newfd);
         if (stale >= 0) {
-            kbox_lkl_close(ctx->sysnrs, stale);
+            lkl_close_and_invalidate(ctx, stale);
             kbox_fd_table_remove(ctx->fd_table, newfd);
         } else {
             long sv = kbox_fd_table_find_by_host_fd(ctx->fd_table, newfd);
@@ -2525,7 +2559,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
                             ref = 1;
                     if (!ref) {
                         kbox_net_deregister_socket((int) sl);
-                        kbox_lkl_close(ctx->sysnrs, sl);
+                        lkl_close_and_invalidate(ctx, sl);
                     }
                 }
             }
@@ -2542,11 +2576,11 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
 
     long existing = kbox_fd_table_remove(ctx->fd_table, newfd);
     if (existing >= 0)
-        kbox_lkl_close(ctx->sysnrs, existing);
+        lkl_close_and_invalidate(ctx, existing);
 
     int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, oldfd);
     if (kbox_fd_table_insert_at(ctx->fd_table, newfd, ret, mirror) < 0) {
-        kbox_lkl_close(ctx->sysnrs, ret);
+        lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EBADF);
     }
     if (flags & O_CLOEXEC)
@@ -2565,25 +2599,36 @@ static struct kbox_dispatch forward_fstat(
 
     if (lkl_fd < 0)
         return kbox_dispatch_continue();
+    /* If a shadow already exists (from a prior mmap), let the host handle
+     * fstat against the memfd.  Do NOT create a shadow here -- fstat is a
+     * metadata query that LKL answers directly without the expensive
+     * memfd_create + pread loop.
+     */
     {
         struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
         if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
             return kbox_dispatch_continue();
-    }
-    {
-        struct kbox_fd_entry *entry;
-        int shadow_rc = ensure_same_fd_shadow(ctx, req, fd, lkl_fd);
-        if (shadow_rc > 0) {
-            entry = fd_table_entry(ctx->fd_table, fd);
-            if (entry && entry->host_fd == KBOX_FD_LOCAL_ONLY_SHADOW)
-                return forward_local_shadow_fstat(req, ctx, entry);
-            return kbox_dispatch_continue();
-        }
+        if (entry && entry->host_fd == KBOX_FD_LOCAL_ONLY_SHADOW)
+            return forward_local_shadow_fstat(req, ctx, entry);
     }
 
     uint64_t remote_stat = kbox_syscall_request_arg(req, 1);
     if (remote_stat == 0)
         return kbox_dispatch_errno(EFAULT);
+
+    /* Check the stat cache first to avoid an LKL round-trip. */
+#if KBOX_STAT_CACHE_ENABLED
+    for (int ci = 0; ci < KBOX_STAT_CACHE_MAX; ci++) {
+        if (ctx->stat_cache[ci].lkl_fd == lkl_fd) {
+            int wrc = guest_mem_write_small_metadata(
+                ctx, kbox_syscall_request_pid(req), remote_stat,
+                &ctx->stat_cache[ci].st, sizeof(ctx->stat_cache[ci].st));
+            if (wrc < 0)
+                return kbox_dispatch_errno(-wrc);
+            return kbox_dispatch_value(0);
+        }
+    }
+#endif
 
     struct kbox_lkl_stat kst;
     memset(&kst, 0, sizeof(kst));
@@ -2593,6 +2638,17 @@ static struct kbox_dispatch forward_fstat(
 
     struct stat host_stat;
     kbox_lkl_stat_to_host(&kst, &host_stat);
+
+    /* Insert into stat cache (overwrite oldest slot via round-robin). */
+#if KBOX_STAT_CACHE_ENABLED
+    {
+        static unsigned stat_cache_rr;
+        unsigned slot = stat_cache_rr % KBOX_STAT_CACHE_MAX;
+        stat_cache_rr++;
+        ctx->stat_cache[slot].lkl_fd = lkl_fd;
+        ctx->stat_cache[slot].st = host_stat;
+    }
+#endif
 
     int wrc = guest_mem_write_small_metadata(ctx, kbox_syscall_request_pid(req),
                                              remote_stat, &host_stat,
@@ -2655,56 +2711,62 @@ static struct kbox_dispatch forward_newfstatat(
     return kbox_dispatch_value(0);
 }
 
-int kbox_dispatch_try_rewrite_wrapper_fast_path(
-    struct kbox_supervisor_ctx *ctx,
-    const struct kbox_syscall_request *req,
-    struct kbox_dispatch *out)
+/* Guest-thread local fast-path.  Handles syscalls that never touch LKL and
+ * can be resolved on the calling thread without a service-thread round-trip.
+ * Returns 1 if handled (result in *out), 0 if the caller must use the service
+ * thread.  Safe to call from the SIGSYS handler or rewrite trampoline context.
+ *
+ * Three tiers:
+ *   1. Pure emulation -- cached constant values (getpid, getppid, gettid).
+ *   2. Always-CONTINUE -- host kernel handles the syscall unmodified.
+ *   3. Conditional emulation -- e.g. arch_prctl(SET_FS) in trap/rewrite.
+ *
+ * LKL-touching syscalls (stat, openat, read on LKL FDs, etc.) are NOT
+ * handled here; they MUST go through the service thread.
+ */
+int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
+                                      int nr,
+                                      struct kbox_dispatch *out)
 {
-    if (!ctx || !req || !out || !ctx->host_nrs)
-        return 0;
-    if (req->source != KBOX_SYSCALL_SOURCE_REWRITE)
+    if (!h || !out)
         return 0;
 
-    if (req->nr == ctx->host_nrs->newfstatat) {
-        *out = forward_newfstatat(req, ctx);
+    /* Tier 1: pure emulation. */
+    if (nr == h->getpid) {
+        *out = kbox_dispatch_value(1);
         return 1;
     }
-    if (req->nr == ctx->host_nrs->fstat) {
-        *out = forward_fstat(req, ctx);
+    if (nr == h->getppid) {
+        *out = kbox_dispatch_value(0);
         return 1;
     }
-    if (req->nr == ctx->host_nrs->openat) {
-        *out = forward_openat(req, ctx);
+    if (nr == h->gettid) {
+        *out = kbox_dispatch_value(1);
         return 1;
     }
-    if (ctx->host_nrs->openat2 >= 0 && req->nr == ctx->host_nrs->openat2) {
-        *out = forward_openat2(req, ctx);
-        return 1;
-    }
-#if defined(__x86_64__)
-    if (ctx->host_nrs->open >= 0 && req->nr == ctx->host_nrs->open) {
-        *out = forward_open_legacy(req, ctx);
-        return 1;
-    }
-#endif
-    if (req->nr == ctx->host_nrs->read) {
-        *out = forward_read_like(req, ctx, 0);
-        return 1;
-    }
-    if (ctx->host_nrs->pread64 >= 0 && req->nr == ctx->host_nrs->pread64) {
-        *out = forward_read_like(req, ctx, 1);
-        return 1;
-    }
-    if (req->nr == ctx->host_nrs->write) {
-        *out = forward_write(req, ctx);
-        return 1;
-    }
-    if (req->nr == ctx->host_nrs->lseek) {
-        *out = forward_lseek(req, ctx);
-        return 1;
-    }
-    if (req->nr == ctx->host_nrs->close) {
-        *out = forward_close(req, ctx);
+
+    /* Tier 2: always-CONTINUE -- host kernel handles these directly. */
+    if (nr == h->brk || nr == h->futex || nr == h->rseq ||
+        nr == h->set_tid_address || nr == h->set_robust_list ||
+        nr == h->munmap || nr == h->mremap || nr == h->membarrier ||
+        nr == h->madvise || nr == h->wait4 || nr == h->waitid ||
+        nr == h->exit || nr == h->exit_group || nr == h->rt_sigreturn ||
+        nr == h->rt_sigaltstack || nr == h->setitimer || nr == h->getitimer ||
+        nr == h->setpgid || nr == h->getpgid || nr == h->getsid ||
+        nr == h->setsid || nr == h->fork || nr == h->vfork ||
+        nr == h->sched_yield || nr == h->sched_setparam ||
+        nr == h->sched_getparam || nr == h->sched_setscheduler ||
+        nr == h->sched_getscheduler || nr == h->sched_get_priority_max ||
+        nr == h->sched_get_priority_min || nr == h->sched_setaffinity ||
+        nr == h->sched_getaffinity || nr == h->getrlimit ||
+        nr == h->getrusage || nr == h->epoll_create1 || nr == h->epoll_ctl ||
+        nr == h->epoll_wait || nr == h->epoll_pwait || nr == h->ppoll ||
+        nr == h->pselect6 || nr == h->poll || nr == h->nanosleep ||
+        nr == h->clock_nanosleep || nr == h->timerfd_create ||
+        nr == h->timerfd_settime || nr == h->timerfd_gettime ||
+        nr == h->eventfd || nr == h->eventfd2 || nr == h->statfs ||
+        nr == h->fstatfs || nr == h->sysinfo) {
+        *out = kbox_dispatch_continue();
         return 1;
     }
 
@@ -3057,7 +3119,30 @@ static struct kbox_dispatch forward_mount(
         data = databuf;
     }
 
-    long ret = kbox_lkl_mount(ctx->sysnrs, source, tgtbuf, fstype, flags, data);
+    /* Translate paths through normalization and host-root confinement. */
+    char translated_tgt[KBOX_MAX_PATH];
+    rc = kbox_translate_path_for_lkl(pid, tgtbuf, ctx->host_root,
+                                     translated_tgt, sizeof(translated_tgt));
+    if (rc < 0)
+        return kbox_dispatch_errno(-rc);
+
+    /* Translate the source for bind mounts (MS_BIND uses a path, not a
+     * device).  Non-bind sources (device names, "none") pass through
+     * unmodified.
+     */
+    char translated_src[KBOX_MAX_PATH];
+    const char *effective_src = source;
+    if (source && (flags & 0x1000 /* MS_BIND */)) {
+        rc =
+            kbox_translate_path_for_lkl(pid, srcbuf, ctx->host_root,
+                                        translated_src, sizeof(translated_src));
+        if (rc < 0)
+            return kbox_dispatch_errno(-rc);
+        effective_src = translated_src;
+    }
+
+    long ret = kbox_lkl_mount(ctx->sysnrs, effective_src, translated_tgt,
+                              fstype, flags, data);
     return kbox_dispatch_from_lkl(ret);
 }
 
@@ -3076,8 +3161,14 @@ static struct kbox_dispatch forward_umount2(
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
+    char translated[KBOX_MAX_PATH];
+    rc = kbox_translate_path_for_lkl(pid, pathbuf, ctx->host_root, translated,
+                                     sizeof(translated));
+    if (rc < 0)
+        return kbox_dispatch_errno(-rc);
+
     long flags = to_c_long_arg(kbox_syscall_request_arg(req, 1));
-    long ret = kbox_lkl_umount2(ctx->sysnrs, pathbuf, flags);
+    long ret = kbox_lkl_umount2(ctx->sysnrs, translated, flags);
     return kbox_dispatch_from_lkl(ret);
 }
 
@@ -3568,7 +3659,7 @@ static struct kbox_dispatch forward_socket(
         (base_type != SOCK_STREAM && base_type != SOCK_DGRAM)) {
         long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd, 0);
         if (vfd < 0) {
-            kbox_lkl_close(ctx->sysnrs, lkl_fd);
+            lkl_close_and_invalidate(ctx, lkl_fd);
             return kbox_dispatch_errno(EMFILE);
         }
         return kbox_dispatch_value((int64_t) vfd);
@@ -3577,7 +3668,7 @@ static struct kbox_dispatch forward_socket(
     /* Shadow socket bridge for INET with SLIRP. */
     int sp[2];
     if (socketpair(AF_UNIX, base_type | SOCK_CLOEXEC, 0, sp) < 0) {
-        kbox_lkl_close(ctx->sysnrs, lkl_fd);
+        lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(errno);
     }
     fcntl(sp[0], F_SETFL, O_NONBLOCK);
@@ -3588,7 +3679,7 @@ static struct kbox_dispatch forward_socket(
     if (vfd < 0) {
         close(sp[0]);
         close(sp[1]);
-        kbox_lkl_close(ctx->sysnrs, lkl_fd);
+        lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(EMFILE);
     }
 
@@ -3608,7 +3699,7 @@ static struct kbox_dispatch forward_socket(
         kbox_net_deregister_socket((int) lkl_fd);
         close(sp[1]);
         kbox_fd_table_remove(ctx->fd_table, vfd);
-        kbox_lkl_close(ctx->sysnrs, lkl_fd);
+        lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(-host_fd);
     }
     kbox_fd_table_set_host_fd(ctx->fd_table, vfd, host_fd);
@@ -4382,7 +4473,7 @@ static struct kbox_dispatch forward_getrandom(
     }
 
     long ret = kbox_lkl_read(ctx->sysnrs, fd, scratch, (long) buflen);
-    kbox_lkl_close(ctx->sysnrs, fd);
+    lkl_close_and_invalidate(ctx, fd);
 
     if (ret < 0)
         return kbox_dispatch_errno((int) (-ret));
@@ -4565,6 +4656,8 @@ static struct kbox_dispatch forward_pwrite64(
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW)
         return kbox_dispatch_continue();
 
+    invalidate_stat_cache_fd(ctx, lkl_fd);
+
     uint64_t remote_buf = kbox_syscall_request_arg(req, 1);
     int64_t count_raw = to_c_long_arg(kbox_syscall_request_arg(req, 2));
     if (count_raw < 0)
@@ -4641,6 +4734,8 @@ static struct kbox_dispatch forward_writev(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     if (lkl_fd < 0)
         return kbox_dispatch_continue();
+
+    invalidate_stat_cache_fd(ctx, lkl_fd);
 
     pid_t pid = kbox_syscall_request_pid(req);
     uint64_t remote_iov = kbox_syscall_request_arg(req, 1);
@@ -4805,8 +4900,10 @@ static struct kbox_dispatch forward_ftruncate(
 
     long length = to_c_long_arg(kbox_syscall_request_arg(req, 1));
     long ret = kbox_lkl_ftruncate(ctx->sysnrs, lkl_fd, length);
-    if (ret >= 0)
+    if (ret >= 0) {
         invalidate_path_shadow_cache(ctx);
+        invalidate_stat_cache_fd(ctx, lkl_fd);
+    }
     return kbox_dispatch_from_lkl(ret);
 }
 
@@ -4831,8 +4928,10 @@ static struct kbox_dispatch forward_fallocate(
     long ret = kbox_lkl_fallocate(ctx->sysnrs, lkl_fd, mode, offset, len);
     if (ret == -ENOSYS)
         return kbox_dispatch_errno(ENOSYS);
-    if (ret >= 0)
+    if (ret >= 0) {
         invalidate_path_shadow_cache(ctx);
+        invalidate_stat_cache_fd(ctx, lkl_fd);
+    }
     return kbox_dispatch_from_lkl(ret);
 }
 
@@ -5017,13 +5116,13 @@ static struct kbox_dispatch forward_utimensat(
     /* pathname can be NULL for utimensat (operates on dirfd itself).  In
      * that case args[1] == 0.
      */
-    char pathbuf[KBOX_MAX_PATH];
     const char *translated_path = NULL;
     char translated[KBOX_MAX_PATH];
     long lkl_dirfd;
     int rc;
 
     if (kbox_syscall_request_arg(req, 1) != 0) {
+        char pathbuf[KBOX_MAX_PATH];
         rc = guest_mem_read_string(ctx, pid, kbox_syscall_request_arg(req, 1),
                                    pathbuf, sizeof(pathbuf));
         if (rc < 0)
@@ -5165,6 +5264,7 @@ static struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
             int memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
             if (memfd < 0)
                 return kbox_dispatch_errno(ENODEV);
+            kbox_shadow_seal(memfd);
             int injected = request_addfd_at(ctx, req, memfd, (int) fd, 0);
             if (injected < 0) {
                 close(memfd);
@@ -5282,13 +5382,13 @@ static long count_user_ptrs_safe(uint64_t arr_addr, size_t max_count)
 {
     size_t n = 0;
     uint64_t ptr;
-    int rc;
 
     if (arr_addr == 0)
         return -EFAULT;
 
     while (n < max_count) {
         uint64_t offset, probe_addr;
+        int rc;
         if (__builtin_mul_overflow((uint64_t) n, sizeof(uint64_t), &offset) ||
             __builtin_add_overflow(arr_addr, offset, &probe_addr))
             return -EFAULT;
@@ -5523,7 +5623,7 @@ static struct kbox_dispatch trap_userspace_exec(
             }
 
             interp_memfd = kbox_shadow_create(ctx->sysnrs, interp_lkl);
-            kbox_lkl_close(ctx->sysnrs, interp_lkl);
+            lkl_close_and_invalidate(ctx, interp_lkl);
 
             if (interp_memfd < 0) {
                 ilen = interp_memfd;
@@ -5804,7 +5904,7 @@ static struct kbox_dispatch forward_execve(
 
     /* Create a memfd with the binary contents. */
     int exec_memfd = kbox_shadow_create(ctx->sysnrs, lkl_fd);
-    kbox_lkl_close(ctx->sysnrs, lkl_fd);
+    lkl_close_and_invalidate(ctx, lkl_fd);
 
     if (exec_memfd < 0)
         return kbox_dispatch_errno(-exec_memfd);
@@ -5856,7 +5956,7 @@ static struct kbox_dispatch forward_execve(
                 }
 
                 int interp_memfd = kbox_shadow_create(ctx->sysnrs, interp_lkl);
-                kbox_lkl_close(ctx->sysnrs, interp_lkl);
+                lkl_close_and_invalidate(ctx, interp_lkl);
 
                 if (interp_memfd < 0) {
                     close(exec_memfd);
@@ -6002,23 +6102,13 @@ static struct kbox_dispatch forward_execve(
         fprintf(stderr, "kbox: exec %s -> /proc/self/fd/%d\n", pathbuf,
                 tracee_exec_fd);
 
-    /* Clean up CLOEXEC entries before the kernel exec closes them. Without it,
-     * stale shadow socket mappings survive exec and can collide with FD numbers
-     * reused by the new image.
+    /* Clean up CLOEXEC entries from the FD table, matching what a
+     * successful exec will do in the kernel.
      *
-     * WARNING: This destroys CLOEXEC FDs before exec outcome is known.
-     * seccomp-unotify CONTINUE does not report whether the kernel exec succeeds
-     * or fails; the notification is consumed and the supervisor never learns
-     * the result. If exec fails (e.g. ENOENT, EACCES, bad ELF), the tracee
-     * returns to userspace with CLOEXEC descriptors already purged from the FD
-     * table, causing use-after-close on any subsequent I/O to those FDs.
-     *
-     * In practice this is rare: the supervisor validates the binary exists, is
-     * a regular file, and has a valid ELF header before reaching this point.
-     * A correct fix requires either (a) deferring the close to a post-exec
-     * probe (e.g. ptrace EXEC event), or (b) restructuring the supervisor to
-     * snapshot and rollback the FD table on exec failure. Both are substantial
-     * changes for a low-probability edge case.
+     * This is still conservative: if exec later fails, the tracee resumes
+     * after we have already purged those mappings. That rollback problem is
+     * preferable to keeping stale mappings alive across a successful exec,
+     * which misroutes future FD operations in the new image.
      */
     kbox_fd_table_close_cloexec(ctx->fd_table, ctx->sysnrs);
 
@@ -6528,6 +6618,11 @@ struct kbox_dispatch kbox_dispatch_request(
             }
             return kbox_dispatch_errno(EPERM);
         }
+        {
+            int signo = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
+            if (signo == 11 /* SIGSEGV */ || signo == 7 /* SIGBUS */)
+                kbox_procmem_signal_changed();
+        }
         return kbox_dispatch_continue(); /* signal handler registration */
     }
     if (nr == h->rt_sigprocmask) {
@@ -6572,10 +6667,10 @@ struct kbox_dispatch kbox_dispatch_request(
      * guest process tree.  PID is in register args (no TOCTOU).
      */
 
-    /* Accept the guest's virtual PID (1) as equivalent to the real host PID.
-     * getpid/gettid return 1, so raise() calls tgkill(1, 1, sig) which must
-     * reach the host kernel with the real PID. Also accept notif->pid (the
-     * tracee's actual host PID from the seccomp notification).
+    /* Accept the guest's virtual PID (1) as equivalent to the real host
+     * PID. getpid/gettid return 1, so raise() calls tgkill(1, 1, sig) which
+     * must reach the host kernel with the real PID. Also accept notif->pid
+     * (the tracee's actual host PID from the seccomp notification).
      */
 #define IS_GUEST_PID(p) \
     ((p) == ctx->child_pid || (p) == kbox_syscall_request_pid(req) || (p) == 1)
@@ -6595,8 +6690,6 @@ struct kbox_dispatch kbox_dispatch_request(
          */
         {
             pid_t real_target = ctx->child_pid;
-            if (target == 0 || IS_GUEST_PID(target))
-                real_target = ctx->child_pid;
             long ret = syscall(SYS_kill, real_target, sig);
             if (ret < 0)
                 return kbox_dispatch_errno(errno);

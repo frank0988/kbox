@@ -44,18 +44,43 @@ die()
 [ -x "$KBOX" ] || die "kbox binary not found at ${KBOX}"
 [ -f "$ROOTFS" ] || die "rootfs image not found at ${ROOTFS}"
 
+KBOX_TEST_TIMEOUT="${KBOX_TEST_TIMEOUT:-30}"
+
+# Detect timeout command (GNU coreutils on Linux, gtimeout on macOS).
+if command -v timeout > /dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout > /dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+fi
+
+run_with_timeout()
+{
+    if [ -n "$TIMEOUT_CMD" ]; then
+        "$TIMEOUT_CMD" "$KBOX_TEST_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
 expect_success()
 {
     name="$1"
     shift
     printf "  %-40s " "$name"
     OUTPUT=$(mktemp)
-    if "$@" > "$OUTPUT" 2>&1; then
+    if run_with_timeout "$@" > "$OUTPUT" 2>&1; then
         printf "${GREEN}PASS${NC}\n"
         PASS=$((PASS + 1))
     else
-        printf "${RED}FAIL${NC} (exit=$?)\n"
-        cat "$OUTPUT" | head -20
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            printf "${RED}TIMEOUT${NC}\n"
+        else
+            printf "${RED}FAIL${NC} (exit=$rc)\n"
+        fi
+        head -20 "$OUTPUT"
         FAIL=$((FAIL + 1))
     fi
     rm -f "$OUTPUT"
@@ -68,15 +93,25 @@ expect_output()
     shift 2
     printf "  %-40s " "$name"
     OUTPUT=$(mktemp)
-    "$@" > "$OUTPUT" 2>&1
-    if grep -q "$expected" "$OUTPUT"; then
+    if run_with_timeout "$@" > "$OUTPUT" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 0 ] && grep -q "$expected" "$OUTPUT"; then
         printf "${GREEN}PASS${NC}\n"
         PASS=$((PASS + 1))
     else
-        printf "${RED}FAIL${NC}\n"
+        if [ "$rc" -eq 124 ]; then
+            printf "${RED}TIMEOUT${NC}\n"
+        elif [ "$rc" -ne 0 ]; then
+            printf "${RED}FAIL${NC} (exit=$rc)\n"
+        else
+            printf "${RED}FAIL${NC}\n"
+        fi
         echo "    expected pattern: ${expected}"
         echo "    got:"
-        cat "$OUTPUT" | head -10 | sed 's/^/    /'
+        head -10 "$OUTPUT" | sed 's/^/    /'
         FAIL=$((FAIL + 1))
     fi
     rm -f "$OUTPUT"

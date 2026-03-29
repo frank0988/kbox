@@ -291,6 +291,30 @@ static void test_sigsys_runtime_install_uninstall(void)
     ASSERT_EQ(runtime.installed, 0);
 }
 
+static void test_sigsys_runtime_install_preserves_sqpoll(void)
+{
+    struct kbox_supervisor_ctx ctx;
+    struct kbox_syscall_trap_runtime runtime;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&runtime, 0, sizeof(runtime));
+#if defined(__x86_64__)
+    ctx.host_nrs = &HOST_NRS_X86_64;
+#elif defined(__aarch64__)
+    ctx.host_nrs = &HOST_NRS_AARCH64;
+#endif
+    runtime.sqpoll = 1;
+
+#if defined(__x86_64__) || defined(__aarch64__)
+    ASSERT_EQ(kbox_syscall_trap_runtime_install(&runtime, &ctx), 0);
+    ASSERT_EQ(runtime.sqpoll, 1);
+    kbox_syscall_trap_runtime_uninstall(&runtime);
+#else
+    ASSERT_EQ(kbox_syscall_trap_runtime_init(&runtime, &ctx, NULL), 0);
+    ASSERT_EQ(runtime.sqpoll, 0);
+#endif
+}
+
 static void test_sigsys_trap_handle_uses_runtime_executor(void)
 {
     struct kbox_supervisor_ctx ctx;
@@ -497,6 +521,33 @@ static void test_trap_active_dispatch_uses_service_thread(void)
 #endif
 }
 
+static void test_trap_active_dispatch_fails_cleanly_during_sqpoll_stop(void)
+{
+    struct kbox_supervisor_ctx ctx;
+    struct kbox_syscall_trap_runtime runtime;
+    struct kbox_syscall_request req;
+    struct kbox_dispatch dispatch;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&req, 0, sizeof(req));
+#if defined(__x86_64__)
+    ctx.host_nrs = &HOST_NRS_X86_64;
+#elif defined(__aarch64__)
+    ctx.host_nrs = &HOST_NRS_AARCH64;
+#endif
+    req.nr = 99;
+
+#if defined(__x86_64__) || defined(__aarch64__)
+    ASSERT_EQ(kbox_syscall_trap_runtime_install(&runtime, &ctx), 0);
+    runtime.sqpoll = 1;
+    __atomic_store_n(&runtime.service_stop, 1, __ATOMIC_RELEASE);
+    ASSERT_EQ(kbox_syscall_trap_active_dispatch(&req, &dispatch), -1);
+    kbox_syscall_trap_runtime_uninstall(&runtime);
+#else
+    ASSERT_EQ(kbox_syscall_trap_active_dispatch(&req, &dispatch), -1);
+#endif
+}
+
 void test_syscall_trap_init(void)
 {
     TEST_REGISTER(test_sigsys_decode_rejects_non_sigsys);
@@ -512,10 +563,12 @@ void test_syscall_trap_init(void)
     TEST_REGISTER(test_sigsys_result_writer);
     TEST_REGISTER(test_sigsys_continue_executes_host_syscall);
     TEST_REGISTER(test_sigsys_runtime_install_uninstall);
+    TEST_REGISTER(test_sigsys_runtime_install_preserves_sqpoll);
     TEST_REGISTER(test_sigsys_trap_handle_uses_runtime_executor);
     TEST_REGISTER(test_sigsys_dispatch_helper);
     TEST_REGISTER(test_trap_runtime_capture_and_dispatch_pending);
     TEST_REGISTER(test_trap_runtime_capture_wakes_fd);
     TEST_REGISTER(test_trap_runtime_service_thread_dispatches);
     TEST_REGISTER(test_trap_active_dispatch_uses_service_thread);
+    TEST_REGISTER(test_trap_active_dispatch_fails_cleanly_during_sqpoll_stop);
 }

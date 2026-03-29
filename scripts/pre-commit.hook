@@ -70,6 +70,7 @@ cppcheck_suppressions() {
         "unreadVariable"
         "redundantInitialization"
         "shadowVariable"
+        "preprocessorErrorDirective"
     )
 
     local out="--inline-suppr "

@@ -34,11 +34,16 @@ struct kbox_syscall_trap_runtime {
     pthread_t service_thread;
     int has_last_request;
     int has_last_dispatch;
-    int has_pending_request;
-    int has_pending_dispatch;
+    /* Cacheline-separated IPC flags: guest writes has_pending_request,
+     * service thread writes has_pending_dispatch.  Separate cache lines
+     * eliminate false sharing on x86_64 (~0.3-1us per call).
+     */
+    _Alignas(64) int has_pending_request;
+    _Alignas(64) int has_pending_dispatch;
     void *active_ucontext;
     sigset_t emulated_pending;
     int installed;
+    int sqpoll;
 #if defined(__x86_64__)
     uint64_t host_fs_base;
     uint64_t guest_fs_base;

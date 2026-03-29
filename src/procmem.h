@@ -84,4 +84,10 @@ int kbox_current_read_open_how(uint64_t remote_addr,
                                uint64_t size,
                                struct kbox_open_how *out);
 
+/* Notify the fault-recovery subsystem that the guest changed SIGSEGV or
+ * SIGBUS disposition via rt_sigaction.  The next safe_memcpy call will
+ * reinstall kbox's handler.
+ */
+void kbox_procmem_signal_changed(void);
+
 #endif /* KBOX_PROCMEM_H */

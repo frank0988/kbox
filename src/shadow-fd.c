@@ -8,10 +8,30 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+#ifndef F_SEAL_WRITE
+#define F_SEAL_WRITE 0x0008
+#endif
+#ifndef F_SEAL_GROW
+#define F_SEAL_GROW 0x0004
+#endif
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK 0x0002
+#endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
 
 #include "lkl-wrap.h"
 #include "seccomp.h"
@@ -40,7 +60,7 @@ int kbox_shadow_create(const struct kbox_sysnrs *s, long lkl_fd)
     if (kst.st_size > KBOX_SHADOW_MAX_SIZE)
         return -EFBIG;
 
-    int memfd = memfd_create("kbox-shadow", MFD_CLOEXEC);
+    int memfd = memfd_create("kbox-shadow", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (memfd < 0)
         return -errno;
 
@@ -98,4 +118,12 @@ int kbox_shadow_create(const struct kbox_sysnrs *s, long lkl_fd)
     }
 
     return memfd;
+}
+
+int kbox_shadow_seal(int memfd)
+{
+    if (memfd < 0)
+        return -1;
+    return fcntl(memfd, F_ADD_SEALS,
+                 F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL);
 }

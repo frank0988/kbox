@@ -18,6 +18,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include "kbox/compiler.h"
 #include "kbox/elf.h"
 #include "kbox/identity.h"
 #include "kbox/image.h"
@@ -84,16 +85,29 @@ extern char **environ;
 
 /* AUTO fast-path selection.
  *
- * The in-process trap/rewrite path delivers faster stat on aarch64 (LKL inode
- * cache, no USER_NOTIF round-trip), but the rewrite runtime currently hangs for
- * dynamically-linked binaries when the patched interpreter dispatches certain
- * syscalls. Pin AUTO to seccomp on all architectures until the rewrite exit
- * path is fixed.
+ * When KBOX_AUTO_FAST_PATH is set (via Kconfig SYSCALL_FAST_PATH=y), AUTO
+ * mode selects rewrite/trap for non-shell, non-networking binaries on
+ * both x86_64 and aarch64.  The guest-thread local fast-path handles 50+
+ * CONTINUE syscalls without service-thread IPC, giving trap/rewrite mode
+ * a throughput advantage for workloads heavy on futex/brk/epoll/mmap.
  *
- * The rewrite fast path remains available via --syscall-mode=rewrite for
- * benchmarking and development.
+ * Users can override with --syscall-mode=rewrite or --syscall-mode=trap.
  */
+#ifndef KBOX_AUTO_FAST_PATH
+#define KBOX_AUTO_FAST_PATH 1
+#endif
+
+/* ASAN and the trap/rewrite path are fundamentally incompatible: the
+ * trap path switches to a guest stack that ASAN doesn't track, and the
+ * dispatch chain accesses ASAN-tracked memory.  AUTO uses seccomp under
+ * ASAN; release builds get the full fast-path.  This is the correct
+ * separation: ASAN tests correctness, release tests performance.
+ */
+#if KBOX_HAS_ASAN
 #define KBOX_AUTO_ENABLE_USERSPACE_FAST_PATH 0
+#else
+#define KBOX_AUTO_ENABLE_USERSPACE_FAST_PATH KBOX_AUTO_FAST_PATH
+#endif
 
 static int is_shell_command(const char *command)
 {
@@ -565,6 +579,10 @@ static void init_launch_ctx(struct kbox_supervisor_ctx *ctx,
 {
     kbox_fd_table_init(fd_table);
     memset(ctx, 0, sizeof(*ctx));
+#if KBOX_STAT_CACHE_ENABLED
+    for (int ci = 0; ci < KBOX_STAT_CACHE_MAX; ci++)
+        ctx->stat_cache[ci].lkl_fd = -1;
+#endif
     ctx->sysnrs = sysnrs;
     ctx->host_nrs = host_nrs;
     ctx->fd_table = fd_table;
@@ -610,6 +628,7 @@ static int run_trap_launch(const struct kbox_image_args *args,
 
     init_launch_ctx(&ctx, &fd_table, args, sysnrs, host_nrs, web_ctx);
 
+    runtime.sqpoll = args->sqpoll;
     if (kbox_syscall_trap_runtime_install(&runtime, &ctx) < 0) {
         fprintf(stderr,
                 "kbox: trap launch failed: cannot install SIGSYS handler\n");
@@ -629,6 +648,15 @@ static int run_trap_launch(const struct kbox_image_args *args,
         return -1;
     }
 
+    /* Install the IP-gated trap filter for the guest's executable ranges.
+     * The userspace trap runtime handles the intercepted syscalls; kbox's
+     * own text stays outside the trapped ranges and executes natively.
+     */
+    if (args->verbose) {
+        for (size_t ri = 0; ri < range_count; ri++)
+            fprintf(stderr, "kbox: trap exec range[%zu]: %p-%p\n", ri,
+                    (void *) ranges[ri].start, (void *) ranges[ri].end);
+    }
     if (kbox_install_seccomp_trap_ranges(host_nrs, ranges, range_count) < 0) {
         fprintf(stderr,
                 "kbox: trap launch failed: cannot install guest trap filter\n");
@@ -650,7 +678,7 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
     struct kbox_supervisor_ctx ctx;
     struct kbox_syscall_trap_runtime trap_runtime;
     struct kbox_rewrite_runtime rewrite_runtime;
-    size_t range_count = 0;
+    size_t range_count;
 
     if (!host_nrs || !launch)
         return -1;
@@ -682,6 +710,7 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
         return -1;
     }
 
+    trap_runtime.sqpoll = args->sqpoll;
     if (kbox_syscall_trap_runtime_install(&trap_runtime, &ctx) < 0) {
         fprintf(stderr,
                 "kbox: rewrite launch failed: cannot install SIGSYS handler\n");
@@ -759,7 +788,7 @@ int kbox_run_image(const struct kbox_image_args *args)
      */
     if (args->syscall_mode == KBOX_SYSCALL_MODE_AUTO) {
 #if KBOX_AUTO_ENABLE_USERSPACE_FAST_PATH
-        if (!is_shell_command(command))
+        if (!is_shell_command(command) && !args->net)
             rewrite_requested = 1;
 #else
         /* On current x86_64 and aarch64 builds, AUTO is intentionally
@@ -1287,20 +1316,10 @@ int kbox_run_image(const struct kbox_image_args *args)
                             exec_report_ok ? &exec_report : NULL,
                             interp_report_ok ? &interp_report_outer : NULL,
                             fork_sites);
-#if defined(__aarch64__)
-                        if (use_trap &&
-                            (exec_open_wrapper_cancel_count > 0 ||
-                             interp_open_wrapper_cancel_count > 0)) {
-                            use_trap = 0;
-                            if (args->verbose) {
-                                fprintf(stderr,
-                                        "kbox: --syscall-mode=auto: "
-                                        "keeping seccomp because "
-                                        "cancel-style open wrappers are "
-                                        "still present\n");
-                            }
-                        }
-#endif
+                        /* Cancel-style open wrappers are now handled
+                         * correctly: all LKL-touching dispatches go through
+                         * the service thread, so no aarch64 override needed.
+                         */
 #endif
                         if (args->verbose && !use_trap) {
                             fprintf(stderr,

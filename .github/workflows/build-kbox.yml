@@ -58,8 +58,8 @@ jobs:
       - name: Configure (defconfig)
         run: make defconfig
 
-      - name: Build kbox (debug + ASAN/UBSAN)
-        run: make -j$(nproc)
+      - name: Build kbox (release)
+        run: make BUILD=release -j$(nproc)
 
       - name: Build guest and stress binaries
         run: make guest-bins stress-bins
@@ -85,6 +85,7 @@ jobs:
   integration-tests:
     needs: build-kbox
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v6

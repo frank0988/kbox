@@ -7,6 +7,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,108 +24,152 @@ static inline pid_t guest_pid(const struct kbox_guest_mem *guest)
     return (pid_t) guest->opaque;
 }
 
-static int ensure_self_mem_fd(void)
+/* Fault-tolerant direct memory access for in-process (trap/rewrite) mode.
+ *
+ * In trap/rewrite mode the guest shares the supervisor's address space.
+ * Guest-provided addresses are directly dereferenceable via memcpy, which
+ * is ~10x faster than pread(/proc/self/mem) or process_vm_readv.  However,
+ * a guest can pass an unmapped address.  Rather than crashing the supervisor,
+ * we install a SIGSEGV/SIGBUS handler that longjmps back to the caller
+ * with -EFAULT.
+ *
+ * The handler is installed once and stays persistent.  A generation counter
+ * tracks guest rt_sigaction(SIGSEGV/SIGBUS) calls; safe_memcpy reinstalls
+ * only when the generation changes.  The guest's prior handler is saved
+ * and forwarded to when the fault is not from safe_memcpy (fault_armed=0).
+ *
+ * Thread safety: the jmp_buf is thread-local.  The single-threaded guest
+ * constraint (CLONE_THREAD returns ENOSYS) ensures safe_memcpy and guest
+ * rt_sigaction are serialized through the same service thread dispatch.
+ */
+static __thread sigjmp_buf fault_jmp;
+static __thread volatile sig_atomic_t fault_armed;
+
+/* Generation counter: bumped by kbox_procmem_signal_changed() whenever
+ * a guest rt_sigaction(SIGSEGV/SIGBUS) is dispatched.  safe_memcpy
+ * reinstalls the handler only when the generation changes, avoiding
+ * 4 sigaction syscalls per call on the hot path.
+ */
+static volatile unsigned fault_handler_gen =
+    1; /* Start at 1 so first call installs */
+static __thread unsigned
+    fault_handler_local_gen; /* Thread-local starts at 0 → mismatch */
+
+/* Saved guest handlers: when kbox installs its fault handler, the guest's
+ * prior handlers are preserved here and forwarded to when fault_armed is 0.
+ */
+static struct sigaction saved_guest_segv;
+static struct sigaction saved_guest_bus;
+
+static void fault_handler(int sig, siginfo_t *info, void *ucontext);
+
+static void restore_default_and_reraise(int sig)
 {
-    static int self_mem_fd = -1;
-    int fd = __atomic_load_n(&self_mem_fd, __ATOMIC_ACQUIRE);
+    struct sigaction sa;
 
-    if (fd >= 0)
-        return fd;
-
-    fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-
-    {
-        int expected = -1;
-        if (!__atomic_compare_exchange_n(&self_mem_fd, &expected, fd, 0,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-            close(fd);
-            fd = expected;
-        }
-    }
-
-    return fd;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+    raise(sig);
 }
 
-static int self_mem_read(uint64_t remote_addr, void *out, size_t len)
+static int action_uses_fault_handler(const struct sigaction *sa)
 {
-    int fd;
-    ssize_t ret;
-
-    if (len == 0)
+    if (!sa)
         return 0;
-    if (remote_addr == 0 || !out)
-        return -EFAULT;
-
-    fd = ensure_self_mem_fd();
-    if (fd < 0)
-        return -errno;
-
-    ret = pread(fd, out, len, (off_t) remote_addr);
-    if (ret < 0)
-        return -errno;
-    if ((size_t) ret != len)
-        return -EIO;
-    return 0;
+    if ((sa->sa_flags & SA_SIGINFO) != 0)
+        return sa->sa_sigaction == fault_handler;
+    return sa->sa_handler == (void (*)(int)) fault_handler;
 }
 
-static int self_mem_read_string(uint64_t remote_addr, char *buf, size_t max_len)
+static void fault_handler(int sig, siginfo_t *info, void *ucontext)
 {
-    int fd;
-    size_t total = 0;
+    if (fault_armed)
+        siglongjmp(fault_jmp, 1);
 
-    enum {
-        KBOX_STRING_READ_CHUNK = 256,
-    };
-
-    if (remote_addr == 0)
-        return -EFAULT;
-    if (max_len == 0)
-        return -EINVAL;
-
-    fd = ensure_self_mem_fd();
-    if (fd < 0)
-        return -errno;
-
-    while (total < max_len) {
-        ssize_t n;
-        size_t i;
-        size_t chunk = max_len - total;
-
-        if (chunk > KBOX_STRING_READ_CHUNK)
-            chunk = KBOX_STRING_READ_CHUNK;
-
-        n = pread(fd, buf + total, chunk, (off_t) (remote_addr + total));
-        if (n < 0)
-            return -errno;
-        if (n == 0)
-            return -EIO;
-
-        for (i = 0; i < (size_t) n; i++) {
-            if (buf[total + i] == '\0')
-                return (int) (total + i);
-        }
-
-        total += (size_t) n;
-
-        if ((size_t) n < chunk)
-            return -EFAULT;
+    /* Not our fault -- forward to the guest's handler if one was saved. */
+    const struct sigaction *guest =
+        (sig == SIGSEGV) ? &saved_guest_segv : &saved_guest_bus;
+    if ((guest->sa_flags & SA_SIGINFO) != 0 && guest->sa_sigaction) {
+        guest->sa_sigaction(sig, info, ucontext);
+        return;
     }
+    if (guest->sa_handler == SIG_IGN)
+        return;
+    if (guest->sa_handler != SIG_DFL) {
+        guest->sa_handler(sig);
+        return;
+    }
+    restore_default_and_reraise(sig);
+}
 
-    if (max_len > 0)
-        buf[0] = '\0';
-    return -ENAMETOOLONG;
+static void install_fault_handler(void)
+{
+    struct sigaction old_segv;
+    struct sigaction old_bus;
+    struct sigaction sa;
+
+    memset(&old_segv, 0, sizeof(old_segv));
+    memset(&old_bus, 0, sizeof(old_bus));
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    if (!action_uses_fault_handler(&old_segv))
+        saved_guest_segv = old_segv;
+    if (!action_uses_fault_handler(&old_bus))
+        saved_guest_bus = old_bus;
+    fault_handler_local_gen = fault_handler_gen;
+}
+
+void kbox_procmem_signal_changed(void)
+{
+    __atomic_add_fetch(&fault_handler_gen, 1, __ATOMIC_RELEASE);
+}
+
+/* Hot path: sigsetjmp + memcpy only (no sigaction syscalls).  The fault
+ * handler is installed once and reinstalled only when the guest modifies
+ * SIGSEGV/SIGBUS via rt_sigaction.  The guest's prior handler is saved
+ * and forwarded to for non-memcpy faults.
+ */
+static int safe_memcpy(void *dst, const void *src, size_t len)
+{
+    unsigned gen = __atomic_load_n(&fault_handler_gen, __ATOMIC_ACQUIRE);
+
+    if (gen != fault_handler_local_gen)
+        install_fault_handler();
+
+    if (sigsetjmp(fault_jmp, 0) != 0) {
+        fault_armed = 0;
+        return -EFAULT;
+    }
+    fault_armed = 1;
+
+    memcpy(dst, src, len);
+    fault_armed = 0;
+    return 0;
 }
 
 int kbox_current_read(uint64_t remote_addr, void *out, size_t len)
 {
-    return self_mem_read(remote_addr, out, len);
+    if (len == 0)
+        return 0;
+    if (remote_addr == 0 || !out)
+        return -EFAULT;
+    return safe_memcpy(out, (const void *) (uintptr_t) remote_addr, len);
 }
 
 int kbox_current_write(uint64_t remote_addr, const void *in, size_t len)
 {
-    return kbox_vm_write(getpid(), remote_addr, in, len);
+    if (len == 0)
+        return 0;
+    if (remote_addr == 0 || !in)
+        return -EFAULT;
+    return safe_memcpy((void *) (uintptr_t) remote_addr, in, len);
 }
 
 int kbox_current_write_force(uint64_t remote_addr, const void *in, size_t len)
@@ -155,7 +202,43 @@ int kbox_current_write_force(uint64_t remote_addr, const void *in, size_t len)
 
 int kbox_current_read_string(uint64_t remote_addr, char *buf, size_t max_len)
 {
-    return self_mem_read_string(remote_addr, buf, max_len);
+    const char *src;
+
+    if (remote_addr == 0)
+        return -EFAULT;
+    if (!buf)
+        return -EFAULT;
+    if (max_len == 0)
+        return -EINVAL;
+    if (max_len > (size_t) INT_MAX)
+        max_len = (size_t) INT_MAX;
+
+    src = (const char *) (uintptr_t) remote_addr;
+
+    {
+        unsigned gen = __atomic_load_n(&fault_handler_gen, __ATOMIC_ACQUIRE);
+
+        if (gen != fault_handler_local_gen)
+            install_fault_handler();
+
+        if (sigsetjmp(fault_jmp, 0) != 0) {
+            fault_armed = 0;
+            return -EFAULT;
+        }
+        fault_armed = 1;
+
+        for (size_t i = 0; i < max_len; i++) {
+            buf[i] = src[i];
+            if (buf[i] == '\0') {
+                fault_armed = 0;
+                return (int) i;
+            }
+        }
+        fault_armed = 0;
+    }
+
+    buf[0] = '\0';
+    return -ENAMETOOLONG;
 }
 
 int kbox_current_read_open_how(uint64_t remote_addr,

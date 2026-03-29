@@ -46,8 +46,9 @@ struct kbox_image_args {
     int web_port;                          /* --web=PORT (default 8080) */
     const char *web_bind;                  /* --web-bind ADDR */
     const char *trace_format;              /* --trace-format=json */
-    const char *const *extra_args;         /* remaining args after -- */
-    int extra_argc;                        /* count of extra_args */
+    bool sqpoll;                   /* --sqpoll: busy-poll service thread */
+    const char *const *extra_args; /* remaining args after -- */
+    int extra_argc;                /* count of extra_args */
 };
 
 struct kbox_args {

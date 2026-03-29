@@ -26,6 +26,43 @@ config HAS_WEB
 
 endmenu
 
+# Syscall Interception
+
+menu "Syscall Interception"
+
+config SYSCALL_FAST_PATH
+    bool "AUTO mode uses rewrite/trap fast-path"
+    default y
+    help
+      When enabled, AUTO mode selects binary rewriting (Tier 2) or
+      SIGSYS trap (Tier 1) for non-shell, non-networking binaries
+      on both x86_64 and aarch64.
+
+      Typical speedups (release build, vs seccomp baseline):
+        aarch64: stat 8x faster, open+close 1.4x faster
+        x86_64:  open+close 1.3x faster, lseek+read 1.7x faster
+
+      The fast-path is automatically disabled in ASAN/UBSAN builds
+      because the trap path switches to a guest stack that ASAN
+      cannot track.  Sanitizer builds use seccomp for correctness
+      testing; release builds get the full fast-path.
+
+      If unsure, say Y.
+
+config STAT_CACHE_SIZE
+    int "FD-local stat cache entries"
+    default 16
+    range 0 256
+    help
+      Number of entries in the per-context fstat result cache.
+      Avoids repeated LKL inode lookups for fstat on the same FD.
+      Set to 0 to disable the cache entirely.
+
+      The cache is invalidated on write, close, truncate, and
+      fallocate operations on the cached FD.
+
+endmenu
+
 # Build Options
 
 menu "Build Options"

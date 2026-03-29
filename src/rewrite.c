@@ -498,7 +498,6 @@ static int rewrite_origin_addr(const struct kbox_rewrite_site *site,
                                uint64_t *origin_out)
 {
     uint64_t origin;
-    uint32_t insn;
 
     if (!site || !origin_out)
         return -1;
@@ -527,10 +526,10 @@ static int rewrite_origin_addr(const struct kbox_rewrite_site *site,
     }
 
     if (site->width == 4) {
-        insn = (uint32_t) site->original[0] |
-               ((uint32_t) site->original[1] << 8) |
-               ((uint32_t) site->original[2] << 16) |
-               ((uint32_t) site->original[3] << 24);
+        uint32_t insn = (uint32_t) site->original[0] |
+                        ((uint32_t) site->original[1] << 8) |
+                        ((uint32_t) site->original[2] << 16) |
+                        ((uint32_t) site->original[3] << 24);
         if ((insn & 0xfc000000u) == 0x14000000u ||
             (insn & 0xfc000000u) == 0x94000000u) {
             *origin_out = site->vaddr;
@@ -652,9 +651,6 @@ enum kbox_rewrite_site_class kbox_rewrite_classify_aarch64_site(
                          ((uint32_t) segment_bytes[site_offset + 9] << 8) |
                          ((uint32_t) segment_bytes[site_offset + 10] << 16) |
                          ((uint32_t) segment_bytes[site_offset + 11] << 24);
-        uint32_t insn3 = 0;
-        uint32_t insn4 = 0;
-
         /* NEG x0, x0 (CB0003E0) followed by RET: error path wrapper. */
         if (next_insn == 0xCB0003E0u && insn2 == 0xd65f03c0u)
             return KBOX_REWRITE_SITE_WRAPPER;
@@ -676,14 +672,16 @@ enum kbox_rewrite_site_class kbox_rewrite_classify_aarch64_site(
         }
 
         if (site_offset + 20 <= segment_size) {
-            insn3 = (uint32_t) segment_bytes[site_offset + 12] |
-                    ((uint32_t) segment_bytes[site_offset + 13] << 8) |
-                    ((uint32_t) segment_bytes[site_offset + 14] << 16) |
-                    ((uint32_t) segment_bytes[site_offset + 15] << 24);
-            insn4 = (uint32_t) segment_bytes[site_offset + 16] |
-                    ((uint32_t) segment_bytes[site_offset + 17] << 8) |
-                    ((uint32_t) segment_bytes[site_offset + 18] << 16) |
-                    ((uint32_t) segment_bytes[site_offset + 19] << 24);
+            uint32_t insn3 =
+                (uint32_t) segment_bytes[site_offset + 12] |
+                ((uint32_t) segment_bytes[site_offset + 13] << 8) |
+                ((uint32_t) segment_bytes[site_offset + 14] << 16) |
+                ((uint32_t) segment_bytes[site_offset + 15] << 24);
+            uint32_t insn4 =
+                (uint32_t) segment_bytes[site_offset + 16] |
+                ((uint32_t) segment_bytes[site_offset + 17] << 8) |
+                ((uint32_t) segment_bytes[site_offset + 18] << 16) |
+                ((uint32_t) segment_bytes[site_offset + 19] << 24);
 
             /* musl __internal_syscall_cancel epilogue:
              *   svc #0
@@ -1036,10 +1034,6 @@ int kbox_rewrite_encode_patch(const struct kbox_rewrite_site *site,
                               uint64_t trampoline_addr,
                               struct kbox_rewrite_patch *patch)
 {
-    int64_t delta;
-    int64_t imm26;
-    uint32_t insn;
-
     if (!site || !patch)
         return -1;
 
@@ -1072,6 +1066,10 @@ int kbox_rewrite_encode_patch(const struct kbox_rewrite_site *site,
     }
 
     if (site->width == 4) {
+        int64_t delta;
+        int64_t imm26;
+        uint32_t insn;
+
         if ((site->vaddr & 3u) != 0 || (trampoline_addr & 3u) != 0)
             return -1;
         delta = (int64_t) trampoline_addr - (int64_t) site->vaddr;
@@ -1264,14 +1262,12 @@ static int collect_planned_sites_array_cb(
 {
     struct planned_site_array *array = opaque;
     struct kbox_rewrite_planned_site *sites;
-    size_t new_cap;
 
     if (!array || !planned)
         return -1;
     if (array->count == array->cap) {
         size_t alloc_size;
-
-        new_cap = array->cap ? array->cap * 2 : 8;
+        size_t new_cap = array->cap ? array->cap * 2 : 8;
         if (new_cap < array->cap ||
             __builtin_mul_overflow(new_cap, sizeof(*sites), &alloc_size))
             return -1;
@@ -1300,14 +1296,12 @@ static int collect_sites_array_cb(const struct kbox_rewrite_site *site,
 {
     struct site_array *array = opaque;
     struct kbox_rewrite_site *new_sites;
-    size_t new_cap;
 
     if (!array || !site)
         return -1;
     if (array->count == array->cap) {
         size_t alloc_size;
-
-        new_cap = array->cap ? array->cap * 2 : 16;
+        size_t new_cap = array->cap ? array->cap * 2 : 16;
         if (new_cap < array->cap ||
             __builtin_mul_overflow(new_cap, sizeof(*new_sites), &alloc_size))
             return -1;
@@ -1925,9 +1919,8 @@ int kbox_rewrite_origin_map_add_site_source(
     enum kbox_loader_mapping_source source)
 {
     uint64_t origin;
-    size_t lo, hi, mid;
+    size_t lo, hi;
     struct kbox_rewrite_origin_entry *entries;
-    size_t new_cap;
 
     if (!map || !site)
         return -1;
@@ -1940,7 +1933,7 @@ int kbox_rewrite_origin_map_add_site_source(
     lo = 0;
     hi = map->count;
     while (lo < hi) {
-        mid = lo + (hi - lo) / 2;
+        size_t mid = lo + (hi - lo) / 2;
         if (map->entries[mid].origin < origin)
             lo = mid + 1;
         else
@@ -1951,8 +1944,7 @@ int kbox_rewrite_origin_map_add_site_source(
 
     if (map->count == map->cap) {
         size_t alloc_size;
-
-        new_cap = map->cap ? map->cap * 2 : 8;
+        size_t new_cap = map->cap ? map->cap * 2 : 8;
         if (new_cap < map->cap ||
             __builtin_mul_overflow(new_cap, sizeof(*entries), &alloc_size))
             return -1;
@@ -1987,7 +1979,6 @@ int kbox_rewrite_origin_map_add_classified(
          */
         uint64_t origin;
         if (rewrite_origin_addr(site, &origin) == 0) {
-            struct kbox_rewrite_origin_entry *entry;
             size_t lo = 0, hi = map->count;
             while (lo < hi) {
                 size_t mid = lo + (hi - lo) / 2;
@@ -1997,7 +1988,7 @@ int kbox_rewrite_origin_map_add_classified(
                     hi = mid;
             }
             if (lo < map->count && map->entries[lo].origin == origin) {
-                entry = &map->entries[lo];
+                struct kbox_rewrite_origin_entry *entry = &map->entries[lo];
                 entry->site_class = site_class;
             }
         }
@@ -2079,14 +2070,12 @@ static int runtime_site_array_append(struct runtime_site_array *array,
                                      const struct runtime_planned_site *site)
 {
     struct runtime_planned_site *sites;
-    size_t new_cap;
 
     if (!array || !site)
         return -1;
     if (array->count == array->cap) {
         size_t alloc_size;
-
-        new_cap = array->cap ? array->cap * 2 : 8;
+        size_t new_cap = array->cap ? array->cap * 2 : 8;
         if (new_cap < array->cap ||
             __builtin_mul_overflow(new_cap, sizeof(*sites), &alloc_size))
             return -1;
@@ -2423,23 +2412,19 @@ static int rewrite_dispatch_request(struct kbox_rewrite_runtime *runtime,
     if (!runtime || !runtime->ctx || !req || !dispatch)
         return -1;
 
-#ifndef KBOX_UNIT_TEST
-    kbox_dispatch_prepare_request_ctx(runtime->ctx, req);
-
-    if (req->source == KBOX_SYSCALL_SOURCE_REWRITE &&
-        rewrite_is_wrapper_site(&runtime->origin_map,
-                                req->instruction_pointer) &&
-        kbox_dispatch_try_rewrite_wrapper_fast_path(runtime->ctx, req,
-                                                    dispatch)) {
-        return 0;
-    }
-#endif
-
-    if (kbox_syscall_trap_active_dispatch(req, dispatch) == 0)
+    /* Fast-path: handle LKL-free syscalls (pure emulation, always-CONTINUE)
+     * directly on the guest thread without a service-thread round-trip.
+     */
+    if (kbox_dispatch_try_local_fast_path(runtime->ctx->host_nrs, req->nr,
+                                          dispatch))
         return 0;
 
-    *dispatch = kbox_dispatch_request(runtime->ctx, req);
-    return 0;
+    /* LKL-touching syscalls must go through the service thread.  LKL
+     * requires its own thread context; calling LKL directly from the
+     * guest thread races with the service thread and crashes under
+     * sustained load on aarch64.
+     */
+    return kbox_syscall_trap_active_dispatch(req, dispatch);
 }
 
 static int rewrite_runtime_should_patch_site(
@@ -2887,14 +2872,13 @@ static int fork_scan_cb(const struct kbox_rewrite_site *site, void *opaque)
 {
     struct fork_scan_ctx *ctx = opaque;
     const struct kbox_host_nrs *h = ctx->host_nrs;
-    int nr;
 
     if (ctx->found)
         return 0; /* Already found one, just skip the rest. */
 
     /* x86_64 8-byte wrapper: extract syscall number from MOV imm32. */
     if (site->width == X86_64_WRAPPER_SITE_LEN && site->original[0] == 0xb8) {
-        nr = (int) x86_64_wrapper_syscall_nr(site->original);
+        int nr = (int) x86_64_wrapper_syscall_nr(site->original);
         if (nr == h->clone || nr == h->fork || nr == h->vfork ||
             nr == h->clone3) {
             ctx->found = 1;

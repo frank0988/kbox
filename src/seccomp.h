@@ -118,6 +118,26 @@ struct kbox_supervisor_ctx {
         translated_path_cache[KBOX_TRANSLATED_PATH_CACHE_MAX];
     struct kbox_literal_path_cache_entry
         literal_path_cache[KBOX_LITERAL_PATH_CACHE_MAX];
+
+    /* LRU stat cache: avoids repeated LKL inode lookups for fstat on the
+     * same FD.  Keyed by lkl_fd.  Invalidated on write/truncate/close.
+     */
+#ifdef KBOX_STAT_CACHE_SIZE
+#define KBOX_STAT_CACHE_MAX KBOX_STAT_CACHE_SIZE
+#else
+#define KBOX_STAT_CACHE_MAX 16
+#endif
+#if KBOX_STAT_CACHE_MAX > 0
+#define KBOX_STAT_CACHE_ENABLED 1
+#define KBOX_STAT_CACHE_STORAGE_MAX KBOX_STAT_CACHE_MAX
+#else
+#define KBOX_STAT_CACHE_ENABLED 0
+#define KBOX_STAT_CACHE_STORAGE_MAX 1
+#endif
+    struct {
+        long lkl_fd; /* -1 = empty slot */
+        struct stat st;
+    } stat_cache[KBOX_STAT_CACHE_STORAGE_MAX];
 };
 
 int kbox_install_seccomp_listener(const struct kbox_host_nrs *h);
@@ -156,10 +176,9 @@ int kbox_syscall_request_from_notif(const void *notif,
 struct kbox_dispatch kbox_dispatch_request(
     struct kbox_supervisor_ctx *ctx,
     const struct kbox_syscall_request *req);
-int kbox_dispatch_try_rewrite_wrapper_fast_path(
-    struct kbox_supervisor_ctx *ctx,
-    const struct kbox_syscall_request *req,
-    struct kbox_dispatch *out);
+int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
+                                      int nr,
+                                      struct kbox_dispatch *out);
 struct kbox_dispatch kbox_dispatch_continue(void);
 struct kbox_dispatch kbox_dispatch_errno(int err);
 struct kbox_dispatch kbox_dispatch_value(int64_t val);

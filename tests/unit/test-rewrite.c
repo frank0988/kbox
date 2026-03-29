@@ -722,6 +722,28 @@ static void test_rewrite_apply_virtual_procinfo_x86_64_wrapper_elf(void)
     ASSERT_EQ(elf[127], 0x90);
 }
 
+static void test_rewrite_apply_virtual_procinfo_x86_64_getppid_wrapper_elf(void)
+{
+    unsigned char elf[160];
+    struct kbox_rewrite_report report;
+    size_t applied = 0;
+
+    build_x86_64_wrapper_elf_nr(elf, sizeof(elf), 110);
+    ASSERT_EQ(kbox_rewrite_apply_virtual_procinfo_elf(elf, sizeof(elf),
+                                                      &applied, &report),
+              0);
+    ASSERT_EQ(report.arch, KBOX_REWRITE_ARCH_X86_64);
+    ASSERT_EQ(applied, 1);
+    ASSERT_EQ(elf[120], 0xb8);
+    ASSERT_EQ(elf[121], 0x00);
+    ASSERT_EQ(elf[122], 0x00);
+    ASSERT_EQ(elf[123], 0x00);
+    ASSERT_EQ(elf[124], 0x00);
+    ASSERT_EQ(elf[125], 0xc3);
+    ASSERT_EQ(elf[126], 0x90);
+    ASSERT_EQ(elf[127], 0x90);
+}
+
 static void test_rewrite_apply_virtual_procinfo_skips_non_procinfo_wrapper(void)
 {
     unsigned char elf[160];
@@ -757,6 +779,29 @@ static void test_rewrite_apply_virtual_procinfo_aarch64_wrapper_elf(void)
     ASSERT_EQ(report.arch, KBOX_REWRITE_ARCH_AARCH64);
     ASSERT_EQ(applied, 1);
     ASSERT_EQ(elf[124], 0x20);
+    ASSERT_EQ(elf[125], 0x00);
+    ASSERT_EQ(elf[126], 0x80);
+    ASSERT_EQ(elf[127], 0xd2);
+    ASSERT_EQ(elf[128], 0xc0);
+    ASSERT_EQ(elf[129], 0x03);
+    ASSERT_EQ(elf[130], 0x5f);
+    ASSERT_EQ(elf[131], 0xd6);
+}
+
+static void test_rewrite_apply_virtual_procinfo_aarch64_getppid_wrapper_elf(
+    void)
+{
+    unsigned char elf[160];
+    struct kbox_rewrite_report report;
+    size_t applied = 0;
+
+    build_aarch64_wrapper_elf_nr(elf, sizeof(elf), 173);
+    ASSERT_EQ(kbox_rewrite_apply_virtual_procinfo_elf(elf, sizeof(elf),
+                                                      &applied, &report),
+              0);
+    ASSERT_EQ(report.arch, KBOX_REWRITE_ARCH_AARCH64);
+    ASSERT_EQ(applied, 1);
+    ASSERT_EQ(elf[124], 0x00);
     ASSERT_EQ(elf[125], 0x00);
     ASSERT_EQ(elf[126], 0x80);
     ASSERT_EQ(elf[127], 0xd2);
@@ -1398,8 +1443,12 @@ void test_rewrite_init(void)
     TEST_REGISTER(test_rewrite_apply_memfd_x86_64);
     TEST_REGISTER(test_rewrite_apply_virtual_procinfo_x86_64_wrapper_elf);
     TEST_REGISTER(
+        test_rewrite_apply_virtual_procinfo_x86_64_getppid_wrapper_elf);
+    TEST_REGISTER(
         test_rewrite_apply_virtual_procinfo_skips_non_procinfo_wrapper);
     TEST_REGISTER(test_rewrite_apply_virtual_procinfo_aarch64_wrapper_elf);
+    TEST_REGISTER(
+        test_rewrite_apply_virtual_procinfo_aarch64_getppid_wrapper_elf);
     TEST_REGISTER(
         test_rewrite_apply_virtual_procinfo_skips_non_procinfo_aarch64);
     TEST_REGISTER(test_rewrite_wrapper_syscall_nr_x86_64);

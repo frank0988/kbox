@@ -64,5 +64,15 @@ ifeq ($(CONFIG_HAS_WEB),y)
   SRCS         += $(WEB_ASSET_SRC)
 endif
 
+# Syscall fast-path (from Kconfig SYSCALL_FAST_PATH)
+ifeq ($(CONFIG_SYSCALL_FAST_PATH),y)
+  CFLAGS += -DKBOX_AUTO_FAST_PATH=1
+else
+  CFLAGS += -DKBOX_AUTO_FAST_PATH=0
+endif
+ifdef CONFIG_STAT_CACHE_SIZE
+  CFLAGS += -DKBOX_STAT_CACHE_SIZE=$(patsubst "%",%,$(CONFIG_STAT_CACHE_SIZE))
+endif
+
 OBJS     = $(SRCS:.c=.o)
 TARGET   = kbox

@@ -12,6 +12,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#include "kbox/compiler.h"
 #include "syscall-trap.h"
 
 static struct kbox_syscall_trap_runtime *active_trap_runtime;
@@ -587,6 +588,11 @@ static int direct_trap_execute(struct kbox_syscall_trap_runtime *runtime,
     if (!runtime || !runtime->ctx || !req || !out)
         return -1;
 
+    /* Fast-path: handle LKL-free syscalls directly on the guest thread. */
+    if (runtime->ctx->host_nrs &&
+        kbox_dispatch_try_local_fast_path(runtime->ctx->host_nrs, req->nr, out))
+        return 0;
+
     if (runtime->service_running) {
         if (kbox_syscall_trap_runtime_capture(runtime, req) < 0)
             return -1;
@@ -647,12 +653,51 @@ static int trap_futex_wake(int *addr)
 
 static int wait_for_pending_dispatch(struct kbox_syscall_trap_runtime *runtime)
 {
+    enum {
+        SPIN_ITERS = 1024,
+    };
+
     if (!runtime)
         return -1;
+
+    if (runtime->sqpoll) {
+        /* SQPOLL: busy-poll without futex. */
+        while (!__atomic_load_n(&runtime->has_pending_dispatch,
+                                __ATOMIC_ACQUIRE)) {
+            if (!runtime->service_running ||
+                __atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE))
+                return -1;
+#if defined(__x86_64__)
+            __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+        return 0;
+    }
+
+    /* Spin briefly before falling back to futex.  1024 iterations is
+     * ~1.5-3us on modern hardware -- catches fast LKL cache hits.
+     */
+    for (int i = 0; i < SPIN_ITERS; i++) {
+        if (__atomic_load_n(&runtime->has_pending_dispatch, __ATOMIC_ACQUIRE))
+            return 0;
+        if (!runtime->service_running ||
+            __atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE))
+            return -1;
+#if defined(__x86_64__)
+        __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
 
     for (;;) {
         if (__atomic_load_n(&runtime->has_pending_dispatch, __ATOMIC_ACQUIRE))
             return 0;
+        if (!runtime->service_running ||
+            __atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE))
+            return -1;
         if (trap_host_futex_wait(&runtime->has_pending_dispatch, 0) < 0)
             return -1;
     }
@@ -1124,7 +1169,40 @@ static void *trap_service_thread_main(void *opaque)
             }
             if (rd == 0)
                 break;
+        } else if (runtime->sqpoll) {
+            /* SQPOLL mode (io_uring paradigm): the service thread
+             * busy-polls has_pending_request without ever sleeping.
+             * Eliminates all futex scheduling latency at the cost of
+             * dedicating one CPU core.  Use for latency-critical
+             * workloads or benchmarking.
+             */
+            while (!__atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE) &&
+                   !__atomic_load_n(&runtime->has_pending_request,
+                                    __ATOMIC_ACQUIRE)) {
+#if defined(__x86_64__)
+                __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+                __asm__ volatile("yield" ::: "memory");
+#endif
+            }
+            if (__atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE))
+                break;
         } else {
+            /* Spin briefly before futex to catch back-to-back requests
+             * without a kernel round-trip.
+             */
+            for (int i = 0; i < 1024; i++) {
+                if (__atomic_load_n(&runtime->has_pending_request,
+                                    __ATOMIC_ACQUIRE))
+                    goto dispatch;
+                if (__atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE))
+                    break;
+#if defined(__x86_64__)
+                __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+                __asm__ volatile("yield" ::: "memory");
+#endif
+            }
             while (!__atomic_load_n(&runtime->service_stop, __ATOMIC_ACQUIRE) &&
                    !__atomic_load_n(&runtime->has_pending_request,
                                     __ATOMIC_ACQUIRE)) {
@@ -1137,6 +1215,7 @@ static void *trap_service_thread_main(void *opaque)
                 break;
         }
 
+    dispatch:
         while (
             __atomic_load_n(&runtime->has_pending_request, __ATOMIC_ACQUIRE)) {
             if (kbox_syscall_trap_runtime_dispatch_pending(runtime, NULL) < 0)
@@ -1361,7 +1440,17 @@ int kbox_syscall_result_to_sigsys(void *ucontext_ptr,
  * safely swap FS to kbox's TLS before calling any C dispatch code
  * (which does have canaries and will work correctly with kbox's FS).
  */
-__attribute__((no_stack_protector)) static void
+/* The SIGSYS handler runs on the guest thread with a seccomp BPF filter
+ * active.  The filter rejects syscalls from unregistered IP ranges with
+ * EPERM.  ASAN instrumentation inserts load/store checks that may issue
+ * syscalls from ASAN runtime IPs (outside registered ranges), deadlocking
+ * the dispatch.  Disable both ASAN and stack protectors.
+ */
+__attribute__((no_stack_protector))
+#if KBOX_HAS_ASAN
+__attribute__((no_sanitize("address")))
+#endif
+static void
 trap_sigsys_handler(int signo, siginfo_t *info, void *ucontext_ptr)
 {
     struct kbox_syscall_trap_runtime *runtime = load_active_trap_runtime();
@@ -1398,12 +1487,15 @@ int kbox_syscall_trap_runtime_install(struct kbox_syscall_trap_runtime *runtime,
                                       struct kbox_supervisor_ctx *ctx)
 {
     struct sigaction sa;
+    int sqpoll;
 
     if (!runtime || !ctx)
         return -1;
 
+    sqpoll = runtime->sqpoll;
     if (kbox_syscall_trap_runtime_init(runtime, ctx, NULL) < 0)
         return -1;
+    runtime->sqpoll = sqpoll;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
     sa.sa_sigaction = trap_sigsys_handler;

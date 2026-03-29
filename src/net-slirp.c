@@ -550,6 +550,7 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             shadow_flush_to_supervisor(sock) < 0) {
             sock->active = 0;
             close(sock->supervisor_fd);
+            sock->supervisor_fd = -1;
             continue;
         }
 
@@ -583,6 +584,7 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
         if (ctx->pfds[pidx].revents & (POLLHUP | POLLERR)) {
             sock->active = 0;
             close(sock->supervisor_fd);
+            sock->supervisor_fd = -1;
             continue;
         }
 
@@ -617,6 +619,7 @@ static void pump_shadow_sockets(struct poll_ctx *ctx, int shadow_base)
             shadow_flush_to_supervisor(sock) < 0) {
             sock->active = 0;
             close(sock->supervisor_fd);
+            sock->supervisor_fd = -1;
             continue;
         }
     }
@@ -899,6 +902,10 @@ int kbox_net_add_device(void)
      */
 
     memset(shadow_sockets, 0, sizeof(shadow_sockets));
+    for (int si = 0; si < MAX_SHADOW_SOCKETS; si++) {
+        shadow_sockets[si].supervisor_fd = -1;
+        shadow_sockets[si].lkl_fd = -1;
+    }
 
     /* Create eventfd for RX queue signaling. */
     rx_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -1002,10 +1009,10 @@ int kbox_net_configure(const struct kbox_sysnrs *sysnrs)
     net_sysnrs = sysnrs;
 
     /* Write /etc/resolv.conf. */
-    const char *resolv = "nameserver " DNS_IP_STR "\n";
     long fd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, "/etc/resolv.conf",
                               0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
     if (fd >= 0) {
+        const char *resolv = "nameserver " DNS_IP_STR "\n";
         kbox_lkl_write(sysnrs, fd, resolv, (long) strlen(resolv));
         kbox_lkl_close(sysnrs, fd);
     }
