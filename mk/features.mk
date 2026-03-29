@@ -32,6 +32,10 @@ SRCS     = $(SRC_DIR)/main.c \
            $(SRC_DIR)/seccomp-notify.c \
            $(SRC_DIR)/shadow-fd.c \
            $(SRC_DIR)/seccomp-dispatch.c \
+           $(SRC_DIR)/dispatch-net.c \
+           $(SRC_DIR)/dispatch-id.c \
+           $(SRC_DIR)/dispatch-exec.c \
+           $(SRC_DIR)/dispatch-misc.c \
            $(SRC_DIR)/seccomp-supervisor.c \
            $(SRC_DIR)/net-slirp.c \
            $(SRC_DIR)/web-telemetry.c \

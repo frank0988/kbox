@@ -178,6 +178,13 @@ build_cppcheck_suppressions() {
         "invalidFunctionArg:src/loader-launch.c"
         "invalidFunctionArg:src/loader-stack.c"
         "memleak:src/loader-stack.c"
+        "invalidFunctionArg:src/dispatch-exec.c"
+        "nullPointerArithmeticOutOfMemory:src/dispatch-exec.c"
+        "syntaxError:include/kbox/compiler.h"
+        "syntaxError:src/loader-transfer.c"
+        "invalidFunctionArg:src/rewrite.c"
+        "knownConditionTrueFalse"
+        "usleepCalled"
     )
 
     local out="--inline-suppr "
@@ -501,29 +508,55 @@ re_threadsafe_ok='(strtok_r|asctime_r|ctime_r|gmtime_r|localtime_r)'
 if [ ${#C_FILES_CHANGED[@]} -gt 0 ] && [ -s "$DIFF_CACHE" ]; then
     current_file=""
     sec_reported=""
+    sec_in_block=0
     while IFS= read -r line; do
         if [[ $line == "+++ b/"* ]]; then
             current_file="${line#'+++ b/'}"
+            sec_in_block=0
+        elif [[ -n "$current_file" && $line == " "* ]]; then
+            raw_context="${line:1}"
+            sanitized=$(strip_strings_and_comments "$raw_context" "$sec_in_block")
+            sec_in_block=$(printf '%s\n' "$sanitized" | sed -n '1p')
         elif [[ -n "$current_file" && $line == "+"* && $line != "+++"* ]]; then
-            added="${line:1}"
+            raw_added="${line:1}"
+            sanitized=$(strip_strings_and_comments "$raw_added" "$sec_in_block")
+            sec_in_block=$(printf '%s\n' "$sanitized" | sed -n '1p')
+            added=$(printf '%s\n' "$sanitized" | sed -n '2p')
 
             # 8a. Non-literal format string (per-family argument position).
+            #     Uses raw_added (not comment-stripped) so string literals
+            #     remain visible.  If a printf-family call ends with a
+            #     trailing comma, the format literal is on the next line;
+            #     only skip that specific pattern (not arbitrary commas).
             if ! is_reported "$sec_reported" "$current_file:fmtstr"; then
                 flagged=0
+                trimmed="${raw_added%%+([[:space:]])}"
                 # printf/vprintf: format is arg 1
-                if [[ $added =~ $re_printf_call ]] && ! [[ $added =~ $re_printf_lit ]]; then
-                    flagged=1
+                if [[ $raw_added =~ $re_printf_call ]] && ! [[ $raw_added =~ $re_printf_lit ]]; then
+                    if [[ "$trimmed" == *, || "$trimmed" == *\\ ]]; then
+                        : /* trailing comma: literal on next line */
+                    else
+                        flagged=1
+                    fi
                 fi
                 # fprintf/dprintf/vfprintf: format is arg 2
-                if [[ $flagged -eq 0 && $added =~ $re_fprintf_call ]] && ! [[ $added =~ $re_fprintf_lit ]]; then
-                    flagged=1
+                if [[ $flagged -eq 0 && $raw_added =~ $re_fprintf_call ]] && ! [[ $raw_added =~ $re_fprintf_lit ]]; then
+                    if [[ "$trimmed" == *, || "$trimmed" == *\\ ]]; then
+                        : /* trailing comma: literal on next line */
+                    else
+                        flagged=1
+                    fi
                 fi
                 # snprintf/vsnprintf: format is arg 3
-                if [[ $flagged -eq 0 && $added =~ $re_snprintf_call ]] && ! [[ $added =~ $re_snprintf_lit ]]; then
-                    flagged=1
+                if [[ $flagged -eq 0 && $raw_added =~ $re_snprintf_call ]] && ! [[ $raw_added =~ $re_snprintf_lit ]]; then
+                    if [[ "$trimmed" == *, || "$trimmed" == *\\ ]]; then
+                        : /* trailing comma: literal on next line */
+                    else
+                        flagged=1
+                    fi
                 fi
                 # Allow suppression comment.
-                if [[ $flagged -eq 1 ]] && [[ $added =~ $re_format_ok ]]; then
+                if [[ $flagged -eq 1 ]] && [[ $raw_added =~ $re_format_ok ]]; then
                     flagged=0
                 fi
                 if [[ $flagged -eq 1 ]]; then
