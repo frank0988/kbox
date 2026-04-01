@@ -102,6 +102,17 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
     }
     kbox_fd_table_set_host_fd(ctx->fd_table, vfd, host_fd);
 
+    /* The ADDFD-injected host_fd may land on a low FD number that already
+     * has a SHADOW_ONLY entry (from pipe tracking or inherited FD scan).
+     * Overwrite it so resolve_lkl_socket finds the LKL socket via the
+     * direct lookup path instead of returning the stale SHADOW_ONLY.
+     */
+    if (host_fd != vfd) {
+        struct kbox_fd_entry *low = fd_table_entry(ctx->fd_table, host_fd);
+        if (low && low->lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
+            kbox_fd_table_remove(ctx->fd_table, host_fd);
+    }
+
     {
         struct kbox_fd_entry *e = fd_table_entry(ctx->fd_table, vfd);
         if (e) {

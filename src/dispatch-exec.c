@@ -234,6 +234,19 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
         return kbox_dispatch_errno(EPERM);
     }
 
+    /* Write the validated flags back to the guest's clone_args struct to
+     * narrow the TOCTOU window: if a sibling thread mutated the flags between
+     * our read and the host kernel's re-read, this overwrites the mutation.
+     *
+     * A residual race remains (sibling writes after our write-back but before
+     * the host kernel reads), but for single-threaded guests -- kbox's normal
+     * mode -- the risk is zero.
+     */
+    int wrc = guest_mem_write(ctx, kbox_syscall_request_pid(req),
+                              kbox_syscall_request_arg(req, 0), &flags,
+                              sizeof(flags));
+    if (wrc < 0)
+        return kbox_dispatch_errno(-wrc);
     return kbox_dispatch_continue();
 }
 
@@ -749,9 +762,12 @@ struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
     if (rc < 0)
         return kbox_dispatch_errno(-rc);
 
-    /* Virtual paths (/proc, /sys, /dev): let the host handle them. */
+    /* Virtual paths (/proc, /sys, /dev) are not executable binaries.
+     * Return ENOENT/EACCES rather than CONTINUE to avoid a TOCTOU window
+     * where a sibling thread could swap the path after validation.
+     */
     if (kbox_is_lkl_virtual_path(translated))
-        return kbox_dispatch_continue();
+        return kbox_dispatch_errno(EACCES);
 
     /* Open the binary from LKL. */
     long lkl_fd =

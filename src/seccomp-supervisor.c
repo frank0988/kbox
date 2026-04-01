@@ -9,6 +9,7 @@
  *
  */
 
+#include <dirent.h>
 #include <errno.h>
 /* seccomp types via seccomp.h -> seccomp-defs.h */
 #include <poll.h>
@@ -360,6 +361,44 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
             fprintf(stderr, "kbox: failed to decode seccomp notification\n");
             goto out;
         }
+
+        /* One-time scan: register every FD the child inherited from the
+         * parent environment as SHADOW_ONLY.  Without this, FDs beyond
+         * stdio (e.g. fd 3 from a logging daemon, fd 255 from bash)
+         * would hit the EBADF policy.  Runs while the tracee is blocked
+         * in USER_NOTIF so no race with the child's own FD operations.
+         */
+        if (!ctx->inherited_fds_tracked) {
+            char fd_dir_path[64];
+            DIR *fd_dir;
+            struct dirent *de;
+
+            snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd",
+                     (int) ctx->child_pid);
+            fd_dir = opendir(fd_dir_path);
+            if (fd_dir) {
+                while ((de = readdir(fd_dir)) != NULL) {
+                    char *endp;
+                    long ifd;
+
+                    if (de->d_name[0] == '.')
+                        continue;
+                    errno = 0;
+                    ifd = strtol(de->d_name, &endp, 10);
+                    if (errno || *endp != '\0' || ifd < 0)
+                        continue;
+                    if (ifd >= KBOX_FD_BASE)
+                        continue;
+                    if (kbox_fd_table_get_lkl(ctx->fd_table, ifd) != -1)
+                        continue;
+                    kbox_fd_table_insert_at(ctx->fd_table, ifd,
+                                            KBOX_LKL_FD_SHADOW_ONLY, 0);
+                }
+                closedir(fd_dir);
+            }
+            ctx->inherited_fds_tracked = 1;
+        }
+
         d = kbox_dispatch_request(ctx, &req);
 
         /* Build and send response. */

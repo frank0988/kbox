@@ -267,6 +267,11 @@ int translate_request_at_path(const struct kbox_syscall_request *req,
                               long *lkl_dirfd);
 int should_continue_for_dirfd(long lkl_dirfd);
 int guest_addr_is_writable(pid_t pid, uint64_t addr);
+int dup_tracee_fd(pid_t pid, int tracee_fd);
+void translate_proc_self(const char *path,
+                         pid_t pid,
+                         char *sv_path,
+                         size_t sv_path_len);
 
 /* FD utilities. */
 
