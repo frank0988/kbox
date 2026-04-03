@@ -43,6 +43,7 @@ static const int deny_nrs[] = {
 
     /* Tracing: supervisor memory/process access attacks */
     101, /* ptrace */
+    310, /* process_vm_readv */
     311, /* process_vm_writev */
     440, /* process_madvise */
     448, /* process_mrelease */
@@ -148,6 +149,7 @@ static const int deny_nrs[] = {
 
     /* Tracing */
     117, /* ptrace */
+    270, /* process_vm_readv */
     271, /* process_vm_writev */
     440, /* process_madvise */
     448, /* process_mrelease */

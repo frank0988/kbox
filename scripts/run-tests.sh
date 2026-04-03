@@ -350,6 +350,12 @@ else
     SKIP=$((SKIP + 1))
 fi
 
+if require_guest_test "process-vm-deny-test"; then
+    expect_output "process-vm-deny-test" "PASS: process_vm_readv denied" \
+        "$KBOX" image -S "$ROOTFS" --syscall-mode=seccomp \
+        -- "/opt/tests/process-vm-deny-test"
+fi
+
 echo ""
 echo "--- Rewrite security ---"
 
