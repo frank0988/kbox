@@ -895,97 +895,71 @@ int kbox_run_image(const struct kbox_image_args *args)
 
     /* Mount the filesystem. */
     opts = join_mount_opts(args, opts_buf, sizeof(opts_buf));
-    if (!opts) {
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
-    }
+    if (!opts)
+        goto err_post_boot;
     ret = lkl_mount_dev((unsigned) disk_id, args->part, fs_type, 0,
                         opts[0] ? opts : NULL, mount_buf, sizeof(mount_buf));
     if (ret < 0) {
         fprintf(stderr, "lkl_mount_dev: %s (%ld)\n", kbox_err_text(ret), ret);
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
+        goto err_post_boot;
     }
 
     /* Detect syscall ABI. */
     sysnrs = detect_sysnrs();
     if (!sysnrs) {
         fprintf(stderr, "detect_sysnrs failed\n");
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
+        goto err_post_boot;
     }
 
     /* Chroot into mountpoint. */
     ret = kbox_lkl_chroot(sysnrs, mount_buf);
     if (ret < 0) {
         fprintf(stderr, "chroot(%s): %s\n", mount_buf, kbox_err_text(ret));
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
+        goto err_post_boot;
     }
 
     /* Recommended mounts. */
     if (args->recommended || args->system_root) {
-        if (kbox_apply_recommended_mounts(sysnrs, args->mount_profile) < 0) {
-            if (args->net)
-                kbox_net_cleanup();
-            return -1;
-        }
+        if (kbox_apply_recommended_mounts(sysnrs, args->mount_profile) < 0)
+            goto err_post_boot;
     }
 
     /* Bind mounts. */
     if (bind_count > 0) {
-        if (kbox_apply_bind_mounts(sysnrs, bind_specs, bind_count) < 0) {
-            if (args->net)
-                kbox_net_cleanup();
-            return -1;
-        }
+        if (kbox_apply_bind_mounts(sysnrs, bind_specs, bind_count) < 0)
+            goto err_post_boot;
     }
 
     /* Working directory. */
     ret = kbox_lkl_chdir(sysnrs, work_dir);
     if (ret < 0) {
         fprintf(stderr, "chdir(%s): %s\n", work_dir, kbox_err_text(ret));
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
+        goto err_post_boot;
     }
 
     /* Identity. */
     if (args->change_id) {
         if (kbox_parse_change_id(args->change_id, &override_uid,
-                                 &override_gid) < 0) {
-            if (args->net)
-                kbox_net_cleanup();
-            return -1;
-        }
+                                 &override_gid) < 0)
+            goto err_post_boot;
     }
 
     {
         int root_id = args->root_id || args->system_root;
         if (kbox_apply_guest_identity(sysnrs, root_id, override_uid,
-                                      override_gid) < 0) {
-            if (args->net)
-                kbox_net_cleanup();
-            return -1;
-        }
+                                      override_gid) < 0)
+            goto err_post_boot;
     }
 
     /* Probe host features.  Rewrite mode skips seccomp-specific probes. */
-    if (kbox_probe_host_features(probe_mode) < 0) {
-        if (args->net)
-            kbox_net_cleanup();
-        return -1;
-    }
+    if (kbox_probe_host_features(probe_mode) < 0)
+        goto err_post_boot;
 
     /* Networking: configure interface (optional). */
     if (args->net) {
         if (kbox_net_configure(sysnrs) < 0) {
             kbox_net_cleanup();
-            return -1;
+            goto err_post_boot;
         }
     }
 
@@ -1558,6 +1532,7 @@ int kbox_run_image(const struct kbox_image_args *args)
         close(exec_memfd);
 
     err_net:
+        kbox_halt_kernel();
 #ifdef KBOX_HAS_WEB
         if (web_ctx)
             kbox_web_shutdown(web_ctx);
@@ -1566,4 +1541,10 @@ int kbox_run_image(const struct kbox_image_args *args)
             kbox_net_cleanup();
         return rc;
     }
+
+err_post_boot:
+    kbox_halt_kernel();
+    if (args->net)
+        kbox_net_cleanup();
+    return -1;
 }
