@@ -6,7 +6,7 @@
 # successful publish.
 #
 # The lkl-nightly release on sysprog21/kbox always contains exactly
-# one x86_64 and one aarch64 tarball (the latest build).
+# one x86_64, one aarch64 tarball and one riscv64 (the latest build).
 name: Build LKL (nightly)
 
 on:
@@ -75,7 +75,7 @@ jobs:
             echo "New upstream commit: ${CURRENT} (was: ${LAST_COMMIT:-none})"
           fi
 
-  # ---- Build x86_64 and aarch64 in parallel ----
+  # ---- Build x86_64, aarch64 and riscv64 in parallel ----
   build:
     needs: check-upstream
     if: needs.check-upstream.outputs.needs_build == 'true'
@@ -89,8 +89,10 @@ jobs:
             runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
+          - arch: riscv64
+            runner: ubuntu-24.04-riscv
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -114,7 +116,7 @@ jobs:
 
       - name: Package
         run: |
-          tar czf liblkl-${{ matrix.arch }}.tar.gz lkl-${{ matrix.arch }}/
+          tar czf liblkl-${{ matrix.arch }}.tar.gz -C lkl-${{ matrix.arch }}/ .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -151,7 +153,7 @@ jobs:
           date=${BUILD_DATE}
           upstream=https://github.com/${{ env.LKL_UPSTREAM }}/commit/${LKL_COMMIT}
 
-          Contains: liblkl-x86_64.tar.gz, liblkl-aarch64.tar.gz
+          Contains: liblkl-x86_64.tar.gz, liblkl-aarch64.tar.gz, liblkl-riscv64.tar.gz
           Each tarball includes: liblkl.a, lkl.h, autoconf.h, vmlinux-gdb.py,
           BUILD_INFO, sha256sums.txt
           EOF
@@ -168,4 +170,5 @@ jobs:
             --notes-file /tmp/release-notes.md \
             --prerelease \
             dist/liblkl-x86_64.tar.gz \
-            dist/liblkl-aarch64.tar.gz
+            dist/liblkl-aarch64.tar.gz \
+            dist/liblkl-riscv64.tar.gz
