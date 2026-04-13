@@ -182,6 +182,7 @@ static int lkl_netdev_id = -1;
 /* Event loop state. */
 
 static pthread_t slirp_thread;
+static int slirp_thread_started; /* __atomic: slirp_thread is valid */
 
 /* Wakeup pipe: write a byte to wake the event loop from poll. */
 static int wakeup_pipe[2] = {-1, -1};
@@ -650,6 +651,17 @@ static int net_tx(struct lkl_netdev *nd, struct iovec *iov, int cnt)
         total += iov[i].iov_len;
     }
 
+    /* If LKL generated TX while the SLIRP event loop is already inside an LKL
+     * socket syscall, routing through tx_pipe can deadlock: the event loop is
+     * the only tx_pipe reader.  In that case we are already on the only thread
+     * allowed to touch libslirp, so feed the packet directly.
+     */
+    if (__atomic_load_n(&slirp_thread_started, __ATOMIC_ACQUIRE) &&
+        pthread_equal(pthread_self(), slirp_thread)) {
+        slirp_input(slirp_instance, tx_buf, (int) total);
+        return 0;
+    }
+
     /* Write length-prefixed frame to TX pipe. */
     uint16_t hdr = (uint16_t) total;
     if (write_all(tx_pipe[1], &hdr, sizeof(hdr)) < 0)
@@ -941,6 +953,7 @@ int kbox_net_add_device(void)
                 strerror(errno));
         goto err_eventfd;
     }
+    __atomic_store_n(&slirp_thread_started, 1, __ATOMIC_RELEASE);
     if (pthread_create(&rx_reader_thread, NULL, rx_reader_loop, NULL) != 0) {
         fprintf(stderr, "kbox: net: rx reader thread failed: %s\n",
                 strerror(errno));
@@ -980,6 +993,7 @@ err_event_thread:
         (void) write(wakeup_pipe[1], &c, 1);
     }
     pthread_join(slirp_thread, NULL);
+    __atomic_store_n(&slirp_thread_started, 0, __ATOMIC_RELEASE);
 err_eventfd:
     close(rx_eventfd);
     rx_eventfd = -1;
@@ -1128,6 +1142,7 @@ void kbox_net_cleanup(void)
     net_poll_hup(&slirp_netdev); /* wake rx_reader_thread via rx_pipe */
 
     pthread_join(slirp_thread, NULL);
+    __atomic_store_n(&slirp_thread_started, 0, __ATOMIC_RELEASE);
     pthread_join(rx_reader_thread, NULL);
 
     /* Close all shadow sockets. */

@@ -315,6 +315,10 @@ start_http_server()
         python3 -m http.server "$HTTP_PORT" > /dev/null 2>&1 &
         HTTP_PID=$!
         sleep 1
+        if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+            wait "$HTTP_PID" 2>/dev/null || true
+            HTTP_PID=""
+        fi
     fi
 }
 
@@ -329,27 +333,46 @@ stop_http_server()
 
 IPERF3_PID=""
 NETSERVER_PID=""
+#Avoid using the default iperf3 port which may be in use on the host.
+IPERF3_PORT="${KBOX_TEST_IPERF_PORT:-55201}"
 
-start_perf_servers()
+start_iperf3_server()
 {
     if command -v iperf3 > /dev/null 2>&1; then
-        iperf3 -s -p 5201 > /dev/null 2>&1 &
+        iperf3 -s -p "$IPERF3_PORT" > /dev/null 2>&1 &
         IPERF3_PID=$!
+        sleep 1
+        if ! kill -0 "$IPERF3_PID" 2>/dev/null; then
+            wait "$IPERF3_PID" 2>/dev/null || true
+            IPERF3_PID=""
+        fi
     fi
-    if command -v netserver > /dev/null 2>&1; then
-        netserver -p 12865 > /dev/null 2>&1 &
-        NETSERVER_PID=$!
-    fi
-    sleep 1
 }
 
-stop_perf_servers()
+stop_iperf3_server()
 {
     if [ -n "$IPERF3_PID" ]; then
         kill "$IPERF3_PID" 2>/dev/null || true
         wait "$IPERF3_PID" 2>/dev/null || true
         IPERF3_PID=""
     fi
+}
+
+start_netserver()
+{
+    if command -v netserver > /dev/null 2>&1; then
+        netserver -p 12865 > /dev/null 2>&1 &
+        NETSERVER_PID=$!
+        sleep 1
+        if ! kill -0 "$NETSERVER_PID" 2>/dev/null; then
+            wait "$NETSERVER_PID" 2>/dev/null || true
+            NETSERVER_PID=""
+        fi
+    fi
+}
+
+stop_netserver()
+{
     if [ -n "$NETSERVER_PID" ]; then
         kill "$NETSERVER_PID" 2>/dev/null || true
         wait "$NETSERVER_PID" 2>/dev/null || true
@@ -383,39 +406,52 @@ if "$KBOX" image -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
         fi
         stop_http_server
     else
-        printf "  %-40s ${YELLOW}SKIP${NC} (python3 not found)\n" "net-tcp-test"
+        printf "  %-40s ${YELLOW}SKIP${NC} (host HTTP server unavailable)\n" "net-tcp-test"
         SKIP=$((SKIP + 1))
     fi
 
-    # Perf tests: start host servers, run guest clients, then clean up.
-    start_perf_servers
+    # Low-pressure TCP stream smoke test.  This checks that guest->host TCP can
+    # complete a small bounded transfer without turning integration tests into
+    # a bulk throughput benchmark.
+    start_iperf3_server
     if [ -n "$IPERF3_PID" ]; then
         if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/iperf3" 2> /dev/null; then
-            expect_success_verbose "net-iperf3" \
-                "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/iperf3 -c 10.0.2.2 -p 5201 -t 1
+            expect_success_verbose "net-iperf3-smoke" \
+                "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/iperf3 \
+                    -c 10.0.2.2 -p "$IPERF3_PORT" \
+                    -n "${KBOX_TEST_IPERF_BYTES:-64K}" \
+                    -l "${KBOX_TEST_IPERF_LEN:-4K}"
         else
-            printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-iperf3"
+            printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-iperf3-smoke"
             SKIP=$((SKIP + 1))
         fi
     else
-        printf "  %-40s ${YELLOW}SKIP${NC} (host iperf3 not found)\n" "net-iperf3"
+        printf "  %-40s ${YELLOW}SKIP${NC} (host iperf3 server unavailable)\n" "net-iperf3-smoke"
         SKIP=$((SKIP + 1))
     fi
+    stop_iperf3_server
 
-    if [ -n "$NETSERVER_PID" ]; then
-        if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/netperf" 2> /dev/null; then
-            # -l 1 runs the test for 1 second instead of the default 10 seconds.
-            expect_success_verbose "net-netperf-tcp-rr" \
-                "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/netperf -H 10.0.2.2 -p 12865 -t TCP_RR -l 1
+    if [ "${KBOX_TEST_NETPERF:-0}" = "1" ]; then
+        start_netserver
+        if [ -n "$NETSERVER_PID" ]; then
+            if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/netperf" 2> /dev/null; then
+                # netperf request/response loops are useful diagnostics, but are
+                # too throughput-sensitive for the default integration suite.
+                expect_success_verbose "net-netperf-tcp-rr" \
+                    "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/netperf -H 10.0.2.2 -p 12865 -t TCP_RR -l 1
+            else
+                printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-netperf"
+                SKIP=$((SKIP + 1))
+            fi
         else
-            printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-netperf"
+            printf "  %-40s ${YELLOW}SKIP${NC} (host netserver unavailable)\n" "net-netperf"
             SKIP=$((SKIP + 1))
         fi
+        stop_netserver
     else
-        printf "  %-40s ${YELLOW}SKIP${NC} (host netserver not found)\n" "net-netperf"
+        printf "  %-40s ${YELLOW}SKIP${NC} (set KBOX_TEST_NETPERF=1)\n" "net-netperf"
         SKIP=$((SKIP + 1))
     fi
-    stop_perf_servers
 
     expect_output "net-ping-gateway" "bytes from" \
         "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "ping -c 1 -W 3 10.0.2.2"
@@ -430,7 +466,7 @@ if "$KBOX" image -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
     expect_output "net-wget-external" "Connecting to" \
         "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "wget -S -O /dev/null http://www.google.com/ 2>&1 || true"
 else
-    for t in net-dns-test net-tcp-test net-iperf3 net-netperf net-ping-gateway net-resolv-conf net-wget-external; do
+    for t in net-dns-test net-tcp-test net-iperf3-smoke net-netperf net-ping-gateway net-resolv-conf net-wget-external; do
         printf "  %-40s ${YELLOW}SKIP${NC} (no SLIRP support)\n" "$t"
         SKIP=$((SKIP + 1))
     done

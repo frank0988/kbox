@@ -2704,11 +2704,11 @@ int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
         nr == h->sched_getaffinity || nr == h->getrlimit ||
         nr == h->getrusage || nr == h->epoll_create1 || nr == h->epoll_ctl ||
         nr == h->epoll_wait || nr == h->epoll_pwait || nr == h->ppoll ||
-        nr == h->pselect6 || nr == h->poll || nr == h->nanosleep ||
-        nr == h->clock_nanosleep || nr == h->timerfd_create ||
-        nr == h->timerfd_settime || nr == h->timerfd_gettime ||
-        nr == h->eventfd || nr == h->eventfd2 || nr == h->statfs ||
-        nr == h->fstatfs || nr == h->sysinfo) {
+        nr == h->pselect6 || nr == h->select || nr == h->poll ||
+        nr == h->nanosleep || nr == h->clock_nanosleep ||
+        nr == h->timerfd_create || nr == h->timerfd_settime ||
+        nr == h->timerfd_gettime || nr == h->eventfd || nr == h->eventfd2 ||
+        nr == h->statfs || nr == h->fstatfs || nr == h->sysinfo) {
         *out = kbox_dispatch_continue();
         return 1;
     }
@@ -3419,13 +3419,33 @@ static struct kbox_dispatch forward_chown_legacy(
     _(sched_setaffinity) _(sched_getaffinity)                                  \
     /* I/O multiplexing. */                                                    \
     _(epoll_create1) _(epoll_ctl) _(epoll_wait) _(epoll_pwait) _(ppoll)        \
-    _(pselect6) _(poll)                                                        \
+    _(pselect6) _(select) _(poll)                                              \
     /* Sleep/timer. */                                                         \
     _(nanosleep) _(clock_nanosleep) _(timerfd_create) _(timerfd_settime)       \
     _(timerfd_gettime) _(eventfd) _(eventfd2)                                  \
     /* Filesystem info. */                                                     \
     _(statfs) _(fstatfs) _(sysinfo)
 /* clang-format on */
+
+/* Check whether a TID belongs to the guest's thread group.
+ *
+ * Threads created via clone(CLONE_THREAD) share the TGID of the main
+ * process but have distinct TIDs.  Validate by probing
+ * /proc/<child_pid>/task/<tid>, which exists iff the TID is a thread
+ * in the guest process's thread group.  Only called as a fallback when
+ * the fast PID checks (child_pid, request pid, virtual 1) miss.
+ */
+static int is_guest_thread(const struct kbox_supervisor_ctx *ctx, pid_t tid)
+{
+    char path[64];
+    struct stat st;
+
+    if (!ctx || ctx->child_pid <= 0 || tid <= 0)
+        return 0;
+    snprintf(path, sizeof(path), "/proc/%d/task/%d", (int) ctx->child_pid,
+             (int) tid);
+    return stat(path, &st) == 0;
+}
 
 struct kbox_dispatch kbox_dispatch_request(
     struct kbox_supervisor_ctx *ctx,
@@ -3650,8 +3670,9 @@ struct kbox_dispatch kbox_dispatch_request(
      * The helper below covers the common tail.
      */
 
-#define IS_GUEST_PID(p) \
-    ((p) == ctx->child_pid || (p) == kbox_syscall_request_pid(req) || (p) == 1)
+#define IS_GUEST_PID(p)                                               \
+    ((p) == ctx->child_pid || (p) == kbox_syscall_request_pid(req) || \
+     (p) == 1 || is_guest_thread(ctx, (p)))
 
 #define DENY_NON_GUEST(pid_val, name)              \
     do {                                           \
@@ -3699,6 +3720,8 @@ struct kbox_dispatch kbox_dispatch_request(
         pid_t target = (pid_t) kbox_syscall_request_arg(req, 0);
         int sig = (int) kbox_syscall_request_arg(req, 1);
         DENY_NON_GUEST(target, "tkill");
+        if (req->source == KBOX_SYSCALL_SOURCE_SECCOMP && target != 1)
+            return kbox_dispatch_continue();
         pid_t real_tid = (target == 1) ? kbox_syscall_request_pid(req) : target;
         long ret = syscall(SYS_tkill, real_tid, sig);
         if (ret < 0)

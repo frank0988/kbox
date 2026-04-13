@@ -159,6 +159,7 @@
     X(epoll_pwait)             \
     X(ppoll)                   \
     X(pselect6)                \
+    X(select)                  \
     X(poll)                    \
     X(nanosleep)               \
     X(clock_nanosleep)         \

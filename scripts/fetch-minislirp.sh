@@ -31,4 +31,8 @@ git clone --depth=1 "${REPO}" "${SLIRP_DIR}"
 # Strip git metadata -- we don't need history.
 rm -rf "${SLIRP_DIR}/.git"
 
+# Patch minislirp to prevent UBSAN misaligned address errors on struct qlink
+# (Network packet bodies are often unaligned to 8 bytes, causing tcpiphdr2qlink macros to fail)
+(cd "${SLIRP_DIR}" && git apply ../../scripts/minislirp-ubsan.patch)
+
 echo "minislirp ready at ${SLIRP_DIR}"

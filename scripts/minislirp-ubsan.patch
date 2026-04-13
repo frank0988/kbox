@@ -1,0 +1,26 @@
+--- a/src/tcp_input.c
++++ b/src/tcp_input.c
+@@ -260,7 +260,11 @@
+          * Checksum extended TCP header and data.
+          */
+         tlen = ip->ip_len;
+-        tcpiphdr2qlink(ti)->next = tcpiphdr2qlink(ti)->prev = NULL;
++        {
++            struct qlink ql;
++            ql.next = ql.prev = NULL;
++            memcpy(((char *)ti) - sizeof(struct qlink), &ql, sizeof(struct qlink));
++        }
+         memset(&ti->ih_mbuf, 0, sizeof(struct mbuf_ptr));
+         memset(&ti->ti, 0, sizeof(ti->ti));
+         ti->ti_x0 = 0;
+@@ -289,5 +293,9 @@
+         tlen = ip6->ip_pl;
+-        tcpiphdr2qlink(ti)->next = tcpiphdr2qlink(ti)->prev = NULL;
++        {
++            struct qlink ql;
++            ql.next = ql.prev = NULL;
++            memcpy(((char *)ti) - sizeof(struct qlink), &ql, sizeof(struct qlink));
++        }
+         memset(&ti->ih_mbuf, 0, sizeof(struct mbuf_ptr));
+         memset(&ti->ti, 0, sizeof(ti->ti));
+         ti->ti_x0 = 0;

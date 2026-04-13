@@ -339,6 +339,7 @@ const struct kbox_host_nrs HOST_NRS_X86_64 = {
     .epoll_pwait = 281,
     .ppoll = 271,
     .pselect6 = 270,
+    .select = 23,
     .poll = 7,
     .nanosleep = 35,
     .clock_nanosleep = 230,
