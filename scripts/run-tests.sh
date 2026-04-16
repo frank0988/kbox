@@ -500,10 +500,10 @@ if "$KBOX" -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
     # TCP test: start host HTTP server, run guest test, then clean up.
     start_http_server
     if [ -n "$HTTP_PID" ]; then
-        if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /opt/tests/net-tcp-test" \
+        if "$KBOX" -S "$ROOTFS" --net -- /bin/sh -c "test -x /opt/tests/net-tcp-test" \
             2> /dev/null; then
             expect_success "net-tcp-test" \
-                "$KBOX" image -S "$ROOTFS" --net -- "/opt/tests/net-tcp-test"
+                "$KBOX" -S "$ROOTFS" --net -- "/opt/tests/net-tcp-test"
         else
             printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-tcp-test"
             SKIP=$((SKIP + 1))
@@ -519,9 +519,9 @@ if "$KBOX" -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
     # a bulk throughput benchmark.
     start_iperf3_server
     if [ -n "$IPERF3_PID" ]; then
-        if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/iperf3" 2> /dev/null; then
+        if "$KBOX" -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/iperf3" 2> /dev/null; then
             expect_success_verbose "net-iperf3-smoke" \
-                "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/iperf3 \
+                "$KBOX" -S "$ROOTFS" --net -- /usr/bin/iperf3 \
                     -c 10.0.2.2 -p "$IPERF3_PORT" \
                     -n "${KBOX_TEST_IPERF_BYTES:-64K}" \
                     -l "${KBOX_TEST_IPERF_LEN:-4K}"
@@ -538,11 +538,11 @@ if "$KBOX" -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
     if [ "${KBOX_TEST_NETPERF:-0}" = "1" ]; then
         start_netserver
         if [ -n "$NETSERVER_PID" ]; then
-            if "$KBOX" image -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/netperf" 2> /dev/null; then
+            if "$KBOX" -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/netperf" 2> /dev/null; then
                 # netperf request/response loops are useful diagnostics, but are
                 # too throughput-sensitive for the default integration suite.
                 expect_success_verbose "net-netperf-tcp-rr" \
-                    "$KBOX" image -S "$ROOTFS" --net -- /usr/bin/netperf -H 10.0.2.2 -p 12865 -t TCP_RR -l 1
+                    "$KBOX" -S "$ROOTFS" --net -- /usr/bin/netperf -H 10.0.2.2 -p 12865 -t TCP_RR -l 1
             else
                 printf "  %-40s ${YELLOW}SKIP${NC} (not in rootfs)\n" "net-netperf"
                 SKIP=$((SKIP + 1))
