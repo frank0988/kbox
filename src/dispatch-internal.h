@@ -72,6 +72,28 @@ static inline int fd_should_deny_io(long fd, long lkl_fd)
     return 1;
 }
 
+/* True when fd is a tracee-visible host FD injected for a shadow socket.
+ * Those FDs are represented via (vfd -> host_fd) metadata, so direct
+ * get_lkl(fd) lookups return -1 even though the FD is valid.
+ */
+static inline int fd_is_shadow_socket_host_fd(
+    const struct kbox_supervisor_ctx *ctx,
+    long fd)
+{
+    long vfd;
+    long lkl_fd;
+
+    if (!ctx || !ctx->fd_table || fd < 0)
+        return 0;
+
+    vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+    if (vfd < 0)
+        return 0;
+
+    lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, vfd);
+    return lkl_fd >= 0;
+}
+
 static inline void track_host_passthrough_fd(struct kbox_fd_table *t, int fd)
 {
     if (kbox_fd_table_insert_at(t, fd, KBOX_LKL_FD_SHADOW_ONLY, 0) < 0)

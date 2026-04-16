@@ -521,7 +521,8 @@ if "$KBOX" -S "$ROOTFS" --net -- /bin/true 2> /dev/null; then
     if [ -n "$IPERF3_PID" ]; then
         if "$KBOX" -S "$ROOTFS" --net -- /bin/sh -c "test -x /usr/bin/iperf3" 2> /dev/null; then
             expect_success_verbose "net-iperf3-smoke" \
-                "$KBOX" -S "$ROOTFS" --net -- /usr/bin/iperf3 \
+                env ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0" \
+                    "$KBOX" -S "$ROOTFS" --net -- /usr/bin/iperf3 \
                     -c 10.0.2.2 -p "$IPERF3_PORT" \
                     -n "${KBOX_TEST_IPERF_BYTES:-64K}" \
                     -l "${KBOX_TEST_IPERF_LEN:-4K}"

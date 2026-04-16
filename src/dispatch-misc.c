@@ -540,6 +540,8 @@ static struct kbox_dispatch dispatch_iov_transfer(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd < 0 && fd_is_shadow_socket_host_fd(ctx, fd))
+        return kbox_dispatch_continue();
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
         (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();

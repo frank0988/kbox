@@ -1680,6 +1680,32 @@ static struct kbox_dispatch forward_getdents_common(
 
 int dup_tracee_fd(pid_t pid, int tracee_fd);
 
+/* Resolve an FD for "gated continue" checks.
+ *
+ * Most host-passthrough FDs are tracked directly at the tracee-visible FD
+ * number (KBOX_LKL_FD_SHADOW_ONLY).  Shadow sockets are different: the tracee
+ * uses an injected host FD, while the LKL association lives on a virtual FD
+ * with host_fd metadata.  For those, fall back to reverse lookup by host_fd.
+ */
+static long resolve_gated_io_fd(struct kbox_supervisor_ctx *ctx, long fd)
+{
+    long lkl_fd;
+    long vfd;
+
+    if (!ctx || !ctx->fd_table)
+        return -1;
+
+    lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd >= 0 || lkl_fd == KBOX_LKL_FD_SHADOW_ONLY)
+        return lkl_fd;
+
+    vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, fd);
+    if (vfd >= 0)
+        return kbox_fd_table_get_lkl(ctx->fd_table, vfd);
+
+    return -1;
+}
+
 /* Gate a CONTINUE syscall that takes an FD in arg0.  Deny if the FD is
  * untracked and in a blocked range; otherwise let the host kernel handle it.
  */
@@ -1688,7 +1714,7 @@ static struct kbox_dispatch forward_fd_gated_continue(
     struct kbox_supervisor_ctx *ctx)
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
-    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    long lkl_fd = resolve_gated_io_fd(ctx, fd);
     if (fd_should_deny_io(fd, lkl_fd))
         return kbox_dispatch_errno(EBADF);
     return kbox_dispatch_continue();
@@ -1701,8 +1727,8 @@ static struct kbox_dispatch forward_epoll_ctl_gated(
 {
     long epfd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 2));
-    long lkl_ep = kbox_fd_table_get_lkl(ctx->fd_table, epfd);
-    long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    long lkl_ep = resolve_gated_io_fd(ctx, epfd);
+    long lkl_fd = resolve_gated_io_fd(ctx, fd);
     if (fd_should_deny_io(epfd, lkl_ep) || fd_should_deny_io(fd, lkl_fd))
         return kbox_dispatch_errno(EBADF);
     return kbox_dispatch_continue();
@@ -2063,6 +2089,8 @@ static struct kbox_dispatch forward_read_like(
 {
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
+    if (lkl_fd < 0 && fd_is_shadow_socket_host_fd(ctx, fd))
+        return kbox_dispatch_continue();
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
         (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
@@ -2170,6 +2198,8 @@ static struct kbox_dispatch forward_write(
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
+    if (lkl_fd < 0 && fd_is_shadow_socket_host_fd(ctx, fd))
+        return kbox_dispatch_continue();
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
         (lkl_fd < 0 && !fd_should_deny_io(fd, lkl_fd)))
         return kbox_dispatch_continue();
@@ -3230,8 +3260,7 @@ int kbox_dispatch_try_local_fast_path(const struct kbox_host_nrs *h,
         nr == h->sched_getaffinity || nr == h->getrlimit ||
         nr == h->getrusage || nr == h->ppoll || nr == h->pselect6 ||
         nr == h->select || nr == h->poll || nr == h->nanosleep ||
-        nr == h->clock_nanosleep ||
-        nr == h->statfs || nr == h->sysinfo) {
+        nr == h->clock_nanosleep || nr == h->statfs || nr == h->sysinfo) {
         *out = kbox_dispatch_continue();
         return 1;
     }
