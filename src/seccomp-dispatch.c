@@ -4178,6 +4178,7 @@ static struct kbox_dispatch forward_chown_legacy(
     _(bind, forward_bind)                                                     \
     _(connect, forward_connect)                                               \
     _(sendto, forward_sendto)                                                 \
+    _(sendmsg, forward_sendmsg)                                               \
     _(recvfrom, forward_recvfrom)                                             \
     _(recvmsg, forward_recvmsg)                                               \
     _(getsockopt, forward_getsockopt)                                         \
