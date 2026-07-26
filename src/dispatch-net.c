@@ -435,6 +435,84 @@ struct kbox_dispatch forward_sendto(const struct kbox_syscall_request *req,
     return kbox_dispatch_from_lkl(ret);
 }
 
+/* sendmsg(fd, msg, flags)
+ * For connected sockets, continue through the shadow socket data path.  When a
+ * destination address is present, forward the payload through LKL sendto().
+ */
+struct kbox_dispatch forward_sendmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx)
+{
+    long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
+    long lkl_fd = resolve_lkl_socket(ctx, fd);
+    if (lkl_fd < 0)
+        return kbox_dispatch_continue();
+
+    pid_t pid = kbox_syscall_request_pid(req);
+    uint64_t msg_ptr = kbox_syscall_request_arg(req, 1);
+    long flags = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+
+    if (msg_ptr == 0)
+        return kbox_dispatch_errno(EFAULT);
+
+    struct {
+        uint64_t msg_name;
+        uint32_t msg_namelen;
+        uint32_t __pad0;
+        uint64_t msg_iov;
+        uint64_t msg_iovlen;
+        uint64_t msg_control;
+        uint64_t msg_controllen;
+        int msg_flags;
+    } mh;
+    int rrc = guest_mem_read(ctx, pid, msg_ptr, &mh, sizeof(mh));
+    if (rrc < 0)
+        return kbox_dispatch_errno(-rrc);
+
+    if (mh.msg_name == 0 || mh.msg_namelen == 0)
+        return kbox_dispatch_continue();
+    if (mh.msg_namelen > 128)
+        return kbox_dispatch_errno(EINVAL);
+
+    size_t niov = (size_t) mh.msg_iovlen;
+    if (niov > 64)
+        niov = 64;
+
+    struct {
+        uint64_t iov_base;
+        uint64_t iov_len;
+    } iovs[64];
+    if (niov > 0) {
+        rrc = guest_mem_read(ctx, pid, mh.msg_iov, iovs,
+                             niov * sizeof(iovs[0]));
+        if (rrc < 0)
+            return kbox_dispatch_errno(-rrc);
+    }
+
+    uint8_t buf[65536];
+    size_t total_len = 0;
+    for (size_t v = 0; v < niov && total_len < sizeof(buf); v++) {
+        size_t chunk_len = (size_t) iovs[v].iov_len;
+        if (chunk_len > sizeof(buf) - total_len)
+            chunk_len = sizeof(buf) - total_len;
+        if (chunk_len == 0)
+            continue;
+        rrc = guest_mem_read(ctx, pid, iovs[v].iov_base, buf + total_len,
+                             chunk_len);
+        if (rrc < 0)
+            return kbox_dispatch_errno(-rrc);
+        total_len += chunk_len;
+    }
+
+    uint8_t addr[128];
+    rrc = guest_mem_read(ctx, pid, mh.msg_name, addr, mh.msg_namelen);
+    if (rrc < 0)
+        return kbox_dispatch_errno(-rrc);
+
+    long ret = kbox_lkl_sendto(ctx->sysnrs, lkl_fd, buf, (long) total_len,
+                               flags, addr, (long) mh.msg_namelen);
+    return kbox_dispatch_from_lkl(ret);
+}
+
 /* For shadow sockets, receive data + source address from the LKL socket and
  * write them back to the tracee.
  *

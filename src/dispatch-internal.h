@@ -358,6 +358,8 @@ struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
                                      struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_sendto(const struct kbox_syscall_request *req,
                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_sendmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_recvfrom(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx);
 struct kbox_dispatch forward_recvmsg(const struct kbox_syscall_request *req,

@@ -4,7 +4,7 @@
  *
  * The BPF program has four sections:
  *   1. Arch check: kill on wrong architecture
- *   2. Allow-list: sendmsg, exit, exit_group bypass the supervisor
+ *   2. Allow-list: exit, exit_group, rt_sigreturn bypass the supervisor
  *   3. Deny-list:  dangerous syscalls return EPERM without reaching the
  *      supervisor (seccomp manipulation, ptrace, namespaces, io_uring, etc.)
  *   4. Default:    everything else goes to USER_NOTIF
@@ -421,7 +421,7 @@ static int install_seccomp_filter(
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
         KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
 
-    /* Allow-list: sendmsg, exit, exit_group.
+    /* Allow-list: process-exit and signal-restorer syscalls.
      * These bypass the supervisor entirely.
      */
 #define EMIT_ALLOW(nr)                                             \
@@ -432,20 +432,6 @@ static int install_seccomp_filter(
             KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
     } while (0)
 
-    /* sendmsg MUST stay allow-listed: the child's pre-exec FD transfer uses
-     * sendmsg(SCM_RIGHTS) before the supervisor loop starts. Removing it
-     * deadlocks the child/parent handshake.
-     *
-     * Consequence: guest sendmsg() on shadow sockets bypasses the supervisor
-     * and operates on the AF_UNIX socketpair, losing msg_name addressing.
-     * Callers that need addressed datagrams must use sendto() (intercepted via
-     * forward_sendto). recvmsg() IS intercepted and returns correct source
-     * addresses.
-     *
-     * To fix: restructure supervisor startup to pass the listener FD via
-     * pidfd_getfd or /proc/<pid>/fd instead of SCM_RIGHTS.
-     */
-    EMIT_ALLOW(h->sendmsg);
     EMIT_ALLOW(h->exit);
     EMIT_ALLOW(h->exit_group);
     EMIT_ALLOW(h->rt_sigreturn);
@@ -646,7 +632,6 @@ install_seccomp_trap_ranges_ex(
             KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
     } while (0)
 
-    EMIT_ALLOW(h->sendmsg);
     EMIT_ALLOW(h->exit);
     EMIT_ALLOW(h->exit_group);
     EMIT_ALLOW(h->rt_sigreturn);
