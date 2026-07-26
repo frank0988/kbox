@@ -2,16 +2,17 @@
 /* seccomp-supervisor.c - Fork, install seccomp, exec, supervise.
  *
  * The supervisor creates a socketpair, forks a child process, installs
- * a seccomp-unotify BPF filter in the child, sends the listener FD
- * back over the socketpair, and then execs the target command.  The
- * parent sits in a poll loop receiving intercepted syscalls, forwarding
- * them to LKL, and sending responses back.
+ * a seccomp-unotify BPF filter in the child, duplicates the listener FD
+ * from the child process, and then execs the target command.
+ * The parent sits in a poll loop receiving intercepted syscalls,
+ * forwarding them to LKL, and sending responses back.
  *
  */
 
 #include <dirent.h>
 #include <errno.h>
 /* seccomp types via seccomp.h -> seccomp-defs.h */
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "child-fd.h"
 #include "fd-table.h"
 #include "seccomp.h"
 #include "syscall-nr.h"
@@ -35,7 +37,9 @@
  * seccomp-defs.h via seccomp.h.
  */
 
-/* SCM_RIGHTS helpers. */
+#define KBOX_LISTENER_HANDOFF_ACK 0x4b424f58 /* "KBOX" */
+
+/* Startup handoff helpers. */
 
 /* Create a UNIX socketpair.
  * On success fds[0] and fds[1] are filled; returns 0.
@@ -50,111 +54,73 @@ static int socketpair_create(int fds[2])
     return 0;
 }
 
-/* Send a single file descriptor over a UNIX socket using SCM_RIGHTS.
- */
-static int send_fd(int sock, int fd)
+static int write_exact(int fd, const void *buf, size_t len)
 {
-    char buf = 0;
-    struct iovec iov = {
-        .iov_base = &buf,
-        .iov_len = 1,
-    };
+    const char *p = buf;
 
-    /* Ancillary data buffer.  CMSG_SPACE gives the padded size
-     * needed to carry one int.
-     */
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg_buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
 
-    struct msghdr msg;
-    struct cmsghdr *cmsg;
-
-    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
-    memset(&msg, 0, sizeof(msg));
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.buf;
-    msg.msg_controllen = sizeof(cmsg_buf.buf);
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-    {
-        ssize_t sret;
-        do {
-            sret = sendmsg(sock, &msg, 0);
-        } while (sret < 0 && errno == EINTR);
-        if (sret < 0) {
-            fprintf(stderr, "sendmsg(SCM_RIGHTS): %s\n", strerror(errno));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
             return -1;
         }
+        if (n == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        p += n;
+        len -= (size_t) n;
     }
+
     return 0;
 }
 
-/* Receive a single file descriptor from a UNIX socket via SCM_RIGHTS.
- * Returns the received FD on success, -1 on error.
- */
-static int recv_fd(int sock)
+static int read_exact(int fd, void *buf, size_t len)
 {
-    char buf;
-    struct iovec iov = {
-        .iov_base = &buf,
-        .iov_len = 1,
-    };
+    char *p = buf;
 
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg_buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
 
-    struct msghdr msg;
-    struct cmsghdr *cmsg;
-    ssize_t n;
-    int fd;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        p += n;
+        len -= (size_t) n;
+    }
 
-    memset(&cmsg_buf, 0, sizeof(cmsg_buf));
-    memset(&msg, 0, sizeof(msg));
+    return 0;
+}
 
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.buf;
-    msg.msg_controllen = sizeof(cmsg_buf.buf);
+static int move_handoff_socket_to_hostonly_fd(int *fd)
+{
+    int new_fd;
+
+    if (!fd || *fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
 
     do {
-        n = recvmsg(sock, &msg, 0);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        fprintf(stderr, "recvmsg(SCM_RIGHTS): %s\n", strerror(errno));
-        return -1;
-    }
-    if (n == 0) {
-        fprintf(stderr, "recvmsg: peer closed socket before sending fd\n");
+        new_fd = fcntl(*fd, F_DUPFD_CLOEXEC, KBOX_FD_HOSTONLY_BASE);
+    } while (new_fd < 0 && errno == EINTR);
+    if (new_fd < 0) {
+        fprintf(stderr, "fcntl(F_DUPFD_CLOEXEC, handoff socket): %s\n",
+                strerror(errno));
         return -1;
     }
 
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg) {
-        fprintf(stderr, "recvmsg: missing cmsg header\n");
-        return -1;
-    }
-    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
-        fprintf(stderr, "recvmsg: unexpected cmsg type\n");
-        return -1;
-    }
-    if (cmsg->cmsg_len < CMSG_LEN(sizeof(int))) {
-        fprintf(stderr, "recvmsg: short cmsg payload\n");
-        return -1;
-    }
-
-    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-    return fd;
+    close(*fd);
+    *fd = new_fd;
+    return 0;
 }
 
 /* Build a seccomp_notif_resp from a dispatch result. */
@@ -472,7 +438,7 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
 {
     int sp[2]; /* socketpair */
     pid_t pid;
-    int listener_fd;
+    int listener_fd = -1;
     int exit_code;
     int status;
     struct kbox_fd_table fd_table;
@@ -488,7 +454,7 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
 #error "Unsupported architecture"
 #endif
 
-    /* 1. Create socketpair for passing the listener FD. */
+    /* 1. Create socketpair for the startup listener handoff. */
     if (socketpair_create(sp) < 0)
         return -1;
 
@@ -536,6 +502,14 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
             setrlimit(RLIMIT_NOFILE, &rl);
         }
 
+        /* After USER_NOTIF is installed, low-FD read/write would be
+         * intercepted before the parent has a listener.  Move the handoff
+         * socket into the existing high host-only band so the BPF fast path
+         * allows the fd-number/ack exchange without SCM_RIGHTS.
+         */
+        if (move_handoff_socket_to_hostonly_fd(&sp[1]) < 0)
+            _exit(127);
+
         /* Prevent RT scheduling starvation: cap RLIMIT_RTPRIO to 0
          * so sched_setscheduler(SCHED_FIFO/RR) fails with EPERM.
          * This makes sched_* CONTINUE entries safe.
@@ -569,12 +543,21 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
             _exit(127);
         }
 
-        /* 3c. Send listener FD to parent via SCM_RIGHTS.
-         * sendmsg is in the BPF allow list so this bypasses seccomp. */
-        if (send_fd(sp[1], listener_fd) < 0)
-            _exit(127);
+        /* 3c. Send only the child-local listener FD number.  The parent
+         * duplicates the real listener, then sends an ack so the child cannot
+         * close the listener before duplication completes.
+         */
+        {
+            int ack = 0;
 
-        /* 3d. Close socket and listener; parent owns them now. */
+            if (write_exact(sp[1], &listener_fd, sizeof(listener_fd)) < 0)
+                _exit(127);
+            if (read_exact(sp[1], &ack, sizeof(ack)) < 0 ||
+                ack != KBOX_LISTENER_HANDOFF_ACK)
+                _exit(127);
+        }
+
+        /* 3d. Close socket and listener; parent owns the duplicate now. */
         close(sp[1]);
         close(listener_fd);
 
@@ -620,8 +603,28 @@ int kbox_run_supervisor(const struct kbox_sysnrs *sysnrs,
     /* Parent process. */
     close(sp[1]);
 
-    /* 4a. Receive listener FD from child. */
-    listener_fd = recv_fd(sp[0]);
+    /* 4a. Read the child-local listener FD number and duplicate it. */
+    {
+        int ack = KBOX_LISTENER_HANDOFF_ACK;
+        int child_listener_fd = -1;
+
+        if (read_exact(sp[0], &child_listener_fd, sizeof(child_listener_fd)) <
+            0) {
+            fprintf(stderr, "failed to read seccomp listener fd number: %s\n",
+                    strerror(errno));
+        } else {
+            listener_fd = kbox_child_fd_dup(pid, child_listener_fd);
+            if (listener_fd < 0) {
+                fprintf(stderr, "duplicate seccomp listener fd %d: %s\n",
+                        child_listener_fd, strerror(errno));
+            } else if (write_exact(sp[0], &ack, sizeof(ack)) < 0) {
+                fprintf(stderr, "failed to ack seccomp listener handoff: %s\n",
+                        strerror(errno));
+                close(listener_fd);
+                listener_fd = -1;
+            }
+        }
+    }
     close(sp[0]);
 
     if (listener_fd < 0) {
